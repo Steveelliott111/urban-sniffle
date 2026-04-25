@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 import zipfile
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote as url_quote
 
@@ -82,6 +82,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
+from state_store import SQLiteStateStore
 from telemetry_support import (
     direct_migrated_bytes as _telemetry_direct_migrated_bytes,
     history_direct_migrated_bytes as _telemetry_history_direct_migrated_bytes,
@@ -176,8 +177,12 @@ if SELFTEST_MODE:
 PREFERENCES_PATH = _STATE_ROOT / "preferences.json"
 HISTORY_PATH = _STATE_ROOT / "workload_history.json"
 REMEDIATION_CACHE_PATH = _STATE_ROOT / "remediation_cache.json"
+REMEDIATION_CACHE_MAX_BYTES = 50 * 1024 * 1024
 AUTH_RUNTIME_LOG_PATH = _STATE_ROOT / "auth_runtime.log"
 AUTH_SESSION_HINT_PATH = _STATE_ROOT / "auth_session_hint.json"
+PROJECT_CATALOG_PATH = _STATE_ROOT / "project_catalog.json"
+LIVE_STATE_DUMP_PATH = _STATE_ROOT / "live_state_dump.json"
+STATE_STORE = SQLiteStateStore(_STATE_ROOT / "state.db")
 
 
 def _app_base_dir() -> Path:
@@ -190,6 +195,14 @@ def _runtime_support_dir() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "QuestODMArchitect"
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+APP_INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def _worker_root_for_session(session_id: str | None) -> Path:
+    safe_session_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(session_id or "ps_worker").strip()) or "ps_worker"
+    return _runtime_support_dir() / "workers" / f"{safe_session_id}-{APP_INSTANCE_ID}"
 
 
 def _version_file_path() -> Path:
@@ -346,29 +359,237 @@ def _append_auth_runtime_log(message: str):
         pass
 
 
+def _normalise_auth_session_hint_payload(raw_payload: dict | None) -> dict:
+    safe_payload = raw_payload if isinstance(raw_payload, dict) else {}
+    safe_org_id = str(safe_payload.get("orgId") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", safe_org_id):
+        safe_org_id = ""
+    return {
+        "region": str(safe_payload.get("region") or "").strip().upper(),
+        "orgId": safe_org_id,
+        "updated_at": str(safe_payload.get("updated_at") or "").strip(),
+    }
+
+
 def _load_auth_session_hint() -> dict:
     try:
-        raw_payload = json.loads(AUTH_SESSION_HINT_PATH.read_text(encoding="utf-8-sig"))
+        raw_payload = STATE_STORE.load_auth_hint(legacy_path=AUTH_SESSION_HINT_PATH)
     except Exception:
         raw_payload = {}
-    return {
-        "region": str(raw_payload.get("region") or "").strip().upper(),
-        "orgId": str(raw_payload.get("orgId") or "").strip(),
-        "updated_at": str(raw_payload.get("updated_at") or "").strip(),
-    }
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+    if not raw_payload:
+        try:
+            raw_payload = json.loads(AUTH_SESSION_HINT_PATH.read_text(encoding="utf-8-sig"))
+        except Exception:
+            raw_payload = {}
+        if not isinstance(raw_payload, dict):
+            raw_payload = {}
+    return _normalise_auth_session_hint_payload(raw_payload)
 
 
 def _save_auth_session_hint(region: str = "", org_id: str = ""):
-    payload = {
+    payload = _normalise_auth_session_hint_payload({
         "region": str(region or "").strip().upper(),
         "orgId": str(org_id or "").strip(),
         "updated_at": _utc_iso_now(),
-    }
+    })
+    try:
+        STATE_STORE.save_auth_hint(payload, updated_at_factory=_utc_iso_now)
+    except Exception:
+        pass
     try:
         AUTH_SESSION_HINT_PATH.parent.mkdir(parents=True, exist_ok=True)
         AUTH_SESSION_HINT_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def _normalise_project_catalog_entries(projects) -> list[dict]:
+    payload = []
+    seen_ids = set()
+    for item in projects or []:
+        if not isinstance(item, dict):
+            continue
+        item_copy = dict(item)
+        project_id = str(item_copy.get("ProjectId") or item_copy.get("Id") or "").strip()
+        row_id = str(item_copy.get("Id") or project_id).strip()
+        if not row_id and not project_id:
+            continue
+        canonical_id = row_id or project_id
+        canonical_project_id = project_id or canonical_id
+        if canonical_project_id in seen_ids:
+            continue
+        seen_ids.add(canonical_project_id)
+        item_copy["Id"] = canonical_id
+        item_copy["ProjectId"] = canonical_project_id
+        item_copy["Name"] = str(item_copy.get("Name") or canonical_project_id).strip() or canonical_project_id
+        payload.append(item_copy)
+    return payload
+
+
+def _project_catalog_quality_score(projects) -> int:
+    score = 0
+    for item in _normalise_project_catalog_entries(projects):
+        score += 1
+        for field in ("OrgId", "Stage", "SourceTenantDefaultDomainName", "TargetTenantDefaultDomainName", "Description"):
+            if str(item.get(field) or "").strip():
+                score += 1
+    return score
+
+
+def _select_preferred_project_catalog_snapshot(primary: dict | list | None, fallback: dict | list | None):
+    primary_projects = primary.get("projects") if isinstance(primary, dict) else primary
+    fallback_projects = fallback.get("projects") if isinstance(fallback, dict) else fallback
+    primary_payload = _normalise_project_catalog_entries(primary_projects)
+    fallback_payload = _normalise_project_catalog_entries(fallback_projects)
+    if not fallback_payload:
+        return primary
+    if not primary_payload:
+        return fallback
+    if len(fallback_payload) > len(primary_payload):
+        return fallback
+    if _project_catalog_quality_score(fallback_payload) > _project_catalog_quality_score(primary_payload):
+        return fallback
+    return primary
+
+
+def _load_project_catalog_store() -> dict:
+    raw_payload = {}
+    try:
+        raw_payload = STATE_STORE.load_project_catalog_store(legacy_path=PROJECT_CATALOG_PATH)
+    except Exception:
+        raw_payload = {}
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+    legacy_payload = {}
+    if PROJECT_CATALOG_PATH.exists():
+        try:
+            legacy_payload = json.loads(PROJECT_CATALOG_PATH.read_text(encoding="utf-8-sig"))
+        except Exception:
+            legacy_payload = {}
+        if not isinstance(legacy_payload, dict):
+            legacy_payload = {}
+    if legacy_payload:
+        merged_payload = dict(raw_payload or {})
+        all_org_ids = {
+            *(str(org_id or "").strip() for org_id in (raw_payload or {}).keys()),
+            *(str(org_id or "").strip() for org_id in legacy_payload.keys()),
+        }
+        for org_id in [org for org in all_org_ids if org]:
+            merged_payload[org_id] = _select_preferred_project_catalog_snapshot(
+                (raw_payload or {}).get(org_id),
+                legacy_payload.get(org_id),
+            )
+        raw_payload = merged_payload
+    store = {}
+    if not isinstance(raw_payload, dict):
+        return store
+    for org_id, snapshot in raw_payload.items():
+        safe_org_id = str(org_id or "").strip()
+        if not safe_org_id:
+            continue
+        projects = []
+        updated_at = ""
+        source = ""
+        if isinstance(snapshot, dict):
+            projects = _normalise_project_catalog_entries(snapshot.get("projects"))
+            updated_at = str(snapshot.get("updated_at") or "").strip()
+            source = str(snapshot.get("source") or "").strip().lower()
+        elif isinstance(snapshot, list):
+            projects = _normalise_project_catalog_entries(snapshot)
+        if projects:
+            store[safe_org_id] = {
+                "projects": projects,
+                "updated_at": updated_at,
+                "source": source,
+            }
+    return store
+
+
+def _save_project_catalog_store(store: dict):
+    payload = {}
+    for org_id, snapshot in (store or {}).items():
+        safe_org_id = str(org_id or "").strip()
+        if not safe_org_id or not isinstance(snapshot, dict):
+            continue
+        projects = _normalise_project_catalog_entries(snapshot.get("projects"))
+        if not projects:
+            continue
+        payload[safe_org_id] = {
+            "projects": projects,
+            "updated_at": str(snapshot.get("updated_at") or _utc_iso_now()).strip() or _utc_iso_now(),
+            "source": str(snapshot.get("source") or "").strip().lower(),
+        }
+    try:
+        STATE_STORE.save_project_catalog_store(payload, updated_at_factory=_utc_iso_now)
+    except Exception:
+        pass
+    try:
+        PROJECT_CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PROJECT_CATALOG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _project_catalog_from_live_state_dump(org_id: str) -> list[dict]:
+    safe_org_id = str(org_id or "").strip()
+    if not safe_org_id:
+        return []
+    try:
+        raw_payload = json.loads(LIVE_STATE_DUMP_PATH.read_text(encoding="utf-8-sig"))
+    except Exception:
+        raw_payload = {}
+    progress = raw_payload.get("progress_state") if isinstance(raw_payload, dict) else {}
+    if not isinstance(progress, dict):
+        return []
+    discovered = {}
+    prefix = f"{safe_org_id}:"
+    for key, snapshot in progress.items():
+        safe_key = str(key or "")
+        if not safe_key.startswith(prefix):
+            continue
+        parts = safe_key.split(":", 2)
+        if len(parts) < 2:
+            continue
+        project_id = str(parts[1] or "").strip()
+        if not project_id:
+            continue
+        data = snapshot.get("data") if isinstance(snapshot, dict) else None
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                details = item.get("Details") if isinstance(item.get("Details"), dict) else {}
+                debug = item.get("Debug") if isinstance(item.get("Debug"), dict) else {}
+                name_candidates = (
+                    item.get("ProjectName"),
+                    item.get("Name"),
+                    details.get("Quest Name"),
+                    debug.get("workloadName"),
+                )
+                for candidate in name_candidates:
+                    safe_name = str(candidate or "").strip()
+                    if safe_name:
+                        discovered[project_id] = safe_name
+                        break
+                if project_id in discovered:
+                    break
+        if project_id not in discovered:
+            discovered[project_id] = project_id
+    return _normalise_project_catalog_entries(
+        [{"Id": project_id, "ProjectId": project_id, "Name": name} for project_id, name in discovered.items()]
+    )
+
+
+def _saved_project_catalog_fallback(org_id: str) -> list[dict]:
+    safe_org_id = str(org_id or "").strip()
+    if not safe_org_id:
+        return []
+    derived_projects = _project_catalog_from_live_state_dump(safe_org_id)
+    if derived_projects:
+        return derived_projects
+    return []
 
 
 def _cleanup_stale_interactive_auth_hosts(current_pid: int | None = None) -> int:
@@ -556,16 +777,102 @@ def _default_history_store():
     }
 
 
+def _normalise_history_store(raw_store: dict | None) -> dict:
+    metrics_builder = globals().get("_build_onedrive_progress_metrics")
+    if not callable(metrics_builder):
+        try:
+            from workload_metrics import build_onedrive_progress_metrics as metrics_builder
+        except Exception:
+            metrics_builder = None
+
+    def _history_number(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "")
+            if not cleaned:
+                return None
+            try:
+                number = float(cleaned)
+            except ValueError:
+                return None
+            return int(number) if number.is_integer() else number
+        return None
+
+    safe_store = raw_store if isinstance(raw_store, dict) else {}
+    workloads = safe_store.get("workloads") if isinstance(safe_store.get("workloads"), dict) else {}
+    projects = safe_store.get("projects") if isinstance(safe_store.get("projects"), dict) else {}
+    normalised_workloads = {}
+    for key, entries in workloads.items():
+        if not isinstance(entries, list):
+            continue
+        fixed_entries = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            fixed = dict(entry)
+            display_type = str(fixed.get("displayType") or "").strip().lower()
+            total_objects = int(_history_number(fixed.get("totalObjects")) or 0)
+            completed_objects = int(_history_number(fixed.get("completedObjects")) or 0)
+            migrated_bytes_direct = bool(fixed.get("migratedBytesDirect"))
+            if total_objects > 0:
+                if display_type in {"teams", "m365 groups"}:
+                    fixed["completionPercent"] = round((completed_objects / total_objects) * 100, 1)
+                elif display_type == "onedrive":
+                    status_breakdown = fixed.get("statusBreakdown") if isinstance(fixed.get("statusBreakdown"), dict) else {}
+                    if status_breakdown and callable(metrics_builder):
+                        metrics = metrics_builder(
+                            status_breakdown,
+                            exclude_not_migratable_from_scope=bool(fixed.get("excludeNotMigratableFromScope")),
+                        )
+                        fixed["totalObjects"] = int(metrics["inScopeTotal"])
+                        fixed["completedObjects"] = int(metrics["completedObjects"])
+                        fixed["activeObjects"] = int(metrics["activeObjects"])
+                        fixed["pendingObjects"] = int(metrics["pendingObjects"])
+                        fixed["issueObjects"] = int(metrics["issueObjects"])
+                        fixed["completionPercent"] = round(metrics["completionPercent"], 1)
+                        fixed["statusCompletionPercent"] = round(metrics["healthyCompletionPercent"], 1)
+                        fixed["completedWithIssuesPercent"] = round(metrics["completedWithIssuesPercent"], 1)
+                        fixed["partialPercent"] = round(metrics["partialPercent"], 1)
+                        fixed["activePercent"] = round(metrics["activePercent"], 1)
+                        fixed["blockedPercent"] = round(metrics["blockedPercent"], 1)
+                        fixed["notStartedPercent"] = round(metrics["notStartedPercent"], 1)
+                        fixed["exceptionPercent"] = round(metrics["exceptionPercent"], 1)
+                        fixed["healthyCompletedObjects"] = int(metrics["healthyCompletedObjects"])
+                        fixed["completedWithIssuesObjects"] = int(metrics["completedWithIssuesObjects"])
+                        fixed["partialObjects"] = int(metrics["partialObjects"])
+                        fixed["blockedObjects"] = int(metrics["blockedObjects"])
+                        fixed["notStartedObjects"] = int(metrics["notStartedObjects"])
+                        fixed["exceptionObjects"] = int(metrics["exceptionObjects"])
+                    elif not migrated_bytes_direct:
+                        fixed["completionPercent"] = round((completed_objects / total_objects) * 100, 1)
+            fixed_entries.append(fixed)
+        normalised_workloads[str(key)] = fixed_entries
+    return {
+        "version": 1,
+        "workloads": normalised_workloads,
+        "projects": projects,
+    }
+
+
 def _load_history_store():
+    try:
+        return STATE_STORE.load_history_store(
+            legacy_path=HISTORY_PATH,
+            normalizer=_normalise_history_store,
+            default_factory=_default_history_store,
+        )
+    except Exception:
+        pass
     try:
         if HISTORY_PATH.exists():
             raw = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                return {
-                    "version": 1,
-                    "workloads": raw.get("workloads", {}) if isinstance(raw.get("workloads"), dict) else {},
-                    "projects": raw.get("projects", {}) if isinstance(raw.get("projects"), dict) else {},
-                }
+                return _normalise_history_store(raw)
     except (OSError, json.JSONDecodeError):
         pass
     return _default_history_store()
@@ -584,8 +891,18 @@ def _default_remediation_store():
 
 def _load_remediation_store():
     try:
+        return STATE_STORE.load_remediation_store(
+            legacy_path=REMEDIATION_CACHE_PATH,
+            max_legacy_bytes=REMEDIATION_CACHE_MAX_BYTES,
+            default_factory=_default_remediation_store,
+        )
+    except Exception:
+        pass
+    try:
         if REMEDIATION_CACHE_PATH.exists():
-            raw = json.loads(REMEDIATION_CACHE_PATH.read_text(encoding="utf-8"))
+            if REMEDIATION_CACHE_MAX_BYTES > 0 and REMEDIATION_CACHE_PATH.stat().st_size > REMEDIATION_CACHE_MAX_BYTES:
+                return _default_remediation_store()
+            raw = json.loads(REMEDIATION_CACHE_PATH.read_text(encoding="utf-8-sig"))
             if isinstance(raw, dict):
                 return {
                     "version": 2,
@@ -610,12 +927,78 @@ def _json_safe(value):
     return value
 
 
+def _json_size_bytes(value) -> int:
+    try:
+        return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _remediation_store_snapshot_locked() -> dict:
+    return _json_safe({
+        "version": 2,
+        "snapshots": copy.deepcopy(remediation_store.get("snapshots", {}) if isinstance(remediation_store.get("snapshots"), dict) else {}),
+        "issueSlices": copy.deepcopy(remediation_store.get("issueSlices", {}) if isinstance(remediation_store.get("issueSlices"), dict) else {}),
+    })
+
+
+def _trim_remediation_store_locked():
+    if REMEDIATION_CACHE_MAX_BYTES <= 0:
+        return
+    remediation_store.setdefault("snapshots", {})
+    remediation_store.setdefault("issueSlices", {})
+    while _json_size_bytes(_remediation_store_snapshot_locked()) > REMEDIATION_CACHE_MAX_BYTES:
+        candidates = []
+        for namespace_name, entries in (
+            ("issueSlices", remediation_store.get("issueSlices", {})),
+            ("snapshots", remediation_store.get("snapshots", {})),
+        ):
+            if not isinstance(entries, dict):
+                continue
+            for cache_key, entry in list(entries.items()):
+                generated_at = str(entry.get("generatedAt") or "").strip() if isinstance(entry, dict) else ""
+                candidates.append((0 if namespace_name == "issueSlices" else 1, generated_at, -_json_size_bytes(entry), namespace_name, cache_key))
+        if not candidates:
+            remediation_store["snapshots"] = {}
+            remediation_store["issueSlices"] = {}
+            break
+        _, _, _, namespace_name, cache_key = sorted(candidates)[0]
+        remediation_store.get(namespace_name, {}).pop(cache_key, None)
+
+
+def _cache_remediation_entry(namespace_name: str, cache_key: str, entry: dict) -> bool:
+    safe_namespace = str(namespace_name or "").strip()
+    safe_cache_key = str(cache_key or "").strip()
+    if safe_namespace not in {"snapshots", "issueSlices"} or not safe_cache_key or not isinstance(entry, dict) or not entry:
+        return False
+    safe_entry = _json_safe(copy.deepcopy(entry))
+    if REMEDIATION_CACHE_MAX_BYTES > 0 and _json_size_bytes(safe_entry) > REMEDIATION_CACHE_MAX_BYTES:
+        return False
+    with remediation_cache_lock:
+        remediation_store.setdefault(safe_namespace, {})
+        remediation_store[safe_namespace][safe_cache_key] = safe_entry
+        _trim_remediation_store_locked()
+    _persist_remediation_store()
+    return True
+
+
 def _persist_remediation_store():
     with remediation_cache_lock:
-        snapshot = _json_safe(copy.deepcopy(remediation_store))
+        snapshot = _remediation_store_snapshot_locked()
     try:
+        STATE_STORE.save_remediation_store(
+            snapshot,
+            updated_at_factory=_utc_iso_now,
+            max_payload_bytes=REMEDIATION_CACHE_MAX_BYTES,
+        )
+    except Exception:
+        pass
+    try:
+        encoded = json.dumps(snapshot, indent=2, ensure_ascii=False).encode("utf-8")
+        if REMEDIATION_CACHE_MAX_BYTES > 0 and len(encoded) > REMEDIATION_CACHE_MAX_BYTES:
+            return
         REMEDIATION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        REMEDIATION_CACHE_PATH.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        REMEDIATION_CACHE_PATH.write_bytes(encoded)
     except (OSError, TypeError, ValueError):
         pass
 
@@ -644,16 +1027,13 @@ def _cache_remediation_snapshot(org_id: str, project_id: str, scope: str, payloa
         return
     scope = _normalise_stream(scope or "all")
     cache_key = _remediation_cache_key(org_id, project_id, scope)
-    with remediation_cache_lock:
-        remediation_store.setdefault("snapshots", {})
-        remediation_store["snapshots"][cache_key] = {
-            "orgId": str(org_id or "").strip(),
-            "projectId": str(project_id or "").strip(),
-            "scope": scope,
-            "generatedAt": str(payload.get("generatedAt") or _history_iso_now()),
-            "payload": _json_safe(copy.deepcopy(payload)),
-        }
-    _persist_remediation_store()
+    _cache_remediation_entry("snapshots", cache_key, {
+        "orgId": str(org_id or "").strip(),
+        "projectId": str(project_id or "").strip(),
+        "scope": scope,
+        "generatedAt": str(payload.get("generatedAt") or _history_iso_now()),
+        "payload": payload,
+    })
 
 
 def _invalidate_remediation_snapshot(org_id: str, project_id: str, scope: str = "all"):
@@ -704,17 +1084,14 @@ def _cache_remediation_issue_payload(org_id: str, project_id: str, workload: str
     if not org_id or not project_id or not workload or not state or not isinstance(payload, dict) or not payload:
         return
     cache_key = _remediation_issue_cache_key(org_id, project_id, workload, state)
-    with remediation_cache_lock:
-        remediation_store.setdefault("issueSlices", {})
-        remediation_store["issueSlices"][cache_key] = {
-            "orgId": str(org_id or "").strip(),
-            "projectId": str(project_id or "").strip(),
-            "workload": str(workload or "").strip(),
-            "state": str(state or "").strip(),
-            "generatedAt": str(payload.get("generatedAt") or _history_iso_now()),
-            "payload": _json_safe(copy.deepcopy(payload)),
-        }
-    _persist_remediation_store()
+    _cache_remediation_entry("issueSlices", cache_key, {
+        "orgId": str(org_id or "").strip(),
+        "projectId": str(project_id or "").strip(),
+        "workload": str(workload or "").strip(),
+        "state": str(state or "").strip(),
+        "generatedAt": str(payload.get("generatedAt") or _history_iso_now()),
+        "payload": payload,
+    })
 
 
 def _invalidate_remediation_issue_payload(org_id: str, project_id: str, workload: str, state: str):
@@ -748,6 +1125,10 @@ def _invalidate_remediation_issue_project_payloads(org_id: str, project_id: str,
 def _persist_history_store():
     with history_lock:
         snapshot = copy.deepcopy(history_store)
+    try:
+        STATE_STORE.save_history_store(snapshot, updated_at_factory=_utc_iso_now)
+    except Exception:
+        pass
     try:
         HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         HISTORY_PATH.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
@@ -6178,6 +6559,11 @@ HTML_CONTENT = """
                             logError(`Project restore warmup failed: ${err.message}`);
                         });
                     }, 0);
+                } else if (savedProjectId) {
+                    const nextProjectsByOrg = { ...(appPreferences?.projectsByOrg || {}) };
+                    delete nextProjectsByOrg[orgId];
+                    await persistCurrentPreferences({ projectsByOrg: nextProjectsByOrg });
+                    logError(`Cleared the stale saved project selection for org [${orgId}] because it is not present in the live Quest project catalog.`);
                 }
                 logError("Projects loaded successfully.");
                 refreshConnectionStatusIndicator().catch(() => {});
@@ -6528,7 +6914,6 @@ HTML_CONTENT = """
                     : `Completed at ${new Date().toLocaleTimeString()}`
             });
             logError(`Full Project workspace for project [${resolvedProjectId}] is ready for the primary workload areas.`);
-            warmRemediationInBackground('all', { force });
 
             if (hasBackgroundScopes) {
                 projectWarmupState.backgroundScopes = FULL_PROJECT_BACKGROUND_SCOPES.slice();
@@ -6618,7 +7003,6 @@ HTML_CONTENT = """
                     percent: 100,
                     meta: 'Use Refresh Now to force a live Quest refresh for this workload.'
                 });
-                warmRemediationInBackground(scope, { force: false });
                 if (document.getElementById('workloadView')?.classList.contains('active')) {
                     activateDrilldownView();
                 }
@@ -6649,7 +7033,6 @@ HTML_CONTENT = """
                 renderWorkloads(workloads, {
                     preserveDrilldown: document.getElementById('workloadView')?.classList.contains('active')
                 });
-                warmRemediationInBackground(scope, { force });
                 if (document.getElementById('workloadView')?.classList.contains('active')) {
                     activateDrilldownView();
                 }
@@ -7395,7 +7778,7 @@ HTML_CONTENT = """
                 return { singular: 'user', plural: 'users', scoped: 'Users in scope', completed: 'users completed' };
             }
             if (lowerType === 'sharepoint') {
-                return { singular: 'sharepoint object', plural: 'sharepoint objects', scoped: 'SharePoint objects in scope', completed: 'SharePoint objects completed' };
+                return { singular: 'SharePoint site', plural: 'SharePoint sites', scoped: 'SharePoint sites in scope', completed: 'SharePoint sites completed' };
             }
             if (lowerType === 'accounts') {
                 return { singular: 'account', plural: 'accounts', scoped: 'Accounts in scope', completed: 'accounts completed' };
@@ -7522,7 +7905,7 @@ HTML_CONTENT = """
             if (lowerType === 'teams') return 'team';
             if (lowerType === 'm365 groups') return 'group';
             if (lowerType === 'distribution groups') return 'distribution group';
-            if (lowerType === 'sharepoint') return 'SharePoint object';
+            if (lowerType === 'sharepoint') return 'SharePoint site';
             if (lowerType === 'archive mailboxes') return 'archive mailbox';
             if (lowerType === 'mailboxes') return 'mailbox';
             return getWorkloadEntityLabels(item).singular || 'object';
@@ -7573,7 +7956,7 @@ HTML_CONTENT = """
 
             const preferredMetricLabels = {
                 'onedrive': ['Matched Targets', 'Source Files', 'Source Items', 'Target Items'],
-                'sharepoint': ['Migratable Objects', 'Target Children', 'Source Children'],
+                'sharepoint': ['Sites', 'Migratable Sites', 'SharePoint Objects', 'Target Children', 'Source Children'],
                 'teams': ['Messages', 'Migrated Messages', 'Members', 'Planner Tasks'],
                 'm365 groups': ['Members', 'Planner Plans', 'Planner Tasks'],
                 'distribution groups': ['Matched Targets', 'Distribution Groups'],
@@ -7667,7 +8050,7 @@ HTML_CONTENT = """
             const metricMap = {
                 'archive mailboxes': ['Archive Processed', 'Archive Items to Migrate', 'Archive Items', 'Migration Task Count', 'Scope Collections', 'Average Throughput (bytes/hour)'],
                 'onedrive': ['Matched Targets', 'Source Files', 'Source Items', 'Target Items', 'Migration Task Count', 'Scope Collections', 'Average Throughput (bytes/hour)'],
-                'sharepoint': ['Migratable Objects', 'Source Children', 'Target Children', 'Status: Error', 'SharePoint Objects Queried'],
+                'sharepoint': ['Sites', 'Migratable Sites', 'SharePoint Objects', 'Source Children', 'Target Children', 'Status: Error', 'SharePoint Sites Queried'],
                 'teams': ['Members', 'Messages', 'Migrated Messages', 'Planner Plans', 'Migrated Plans', 'Planner Tasks', 'Migrated Tasks', 'Scope Collections'],
                 'm365 groups': ['Members', 'Planner Plans', 'Migrated Plans', 'Planner Tasks', 'Migrated Tasks', 'Scope Collections'],
                 'distribution groups': ['Matched Targets', 'Distribution Groups', 'Distribution Groups Queried'],
@@ -7686,10 +8069,12 @@ HTML_CONTENT = """
             if (text.includes('messages')) return text.includes('migrated') ? 'Messages migrated by Quest' : 'Total message volume in scope';
             if (text.includes('planner plans')) return text.includes('migrated') ? 'Planner plans migrated' : 'Planner plans discovered in scope';
             if (text.includes('planner tasks')) return text.includes('migrated') ? 'Planner tasks migrated' : 'Planner tasks discovered in scope';
+            if (text.includes('migratable sites')) return 'Sites Quest considers migratable';
             if (text.includes('migratable')) return 'Objects Quest considers migratable';
             if (text.includes('children')) return 'Site structure footprint';
             if (text.includes('scope collections')) return 'Project collections contributing to this view';
             if (text.includes('task count')) return 'Quest migration and assessment task count';
+            if (text.includes('sharepoint sites queried')) return 'SharePoint sites returned for this scoped view';
             if (text.includes('queried')) return 'Objects returned for this scoped view';
             if (text.includes('error')) return 'Quest objects currently surfacing error states';
             if (text.includes('throughput')) return 'Current Quest throughput signal';
@@ -7818,9 +8203,9 @@ HTML_CONTENT = """
                     ['Migrated Data (bytes)', 'Source Size (bytes)', 'Tracked OneDrive data moved versus source size', 'tone-neutral'],
                 ],
                 'sharepoint': [
-                    ['Migratable Objects', 'Objects', 'Objects Quest considers migratable', 'tone-accent'],
+                    ['Migratable Sites', 'Sites', 'Sites Quest considers migratable', 'tone-accent'],
                     ['Target Children', 'Source Children', 'Target site children relative to source children', 'tone-accent'],
-                    ['Status: Error', 'Objects', 'SharePoint objects currently surfacing error state', 'tone-danger'],
+                    ['Status: Error', 'Sites', 'SharePoint sites currently surfacing error state', 'tone-danger'],
                 ],
                 'teams': [
                     ['Migrated Messages', 'Messages', 'Messages migrated relative to scoped message volume', 'tone-accent'],
@@ -8525,6 +8910,43 @@ HTML_CONTENT = """
             const ageHours = taskUpdatedAt ? (Date.now() - taskUpdatedAt.getTime()) / 3600000 : null;
             const taskLooksTerminal = /(completed|stopped|failed)/.test(taskState) && !taskState.includes('issue');
             const remainingObjects = Math.max(pendingObjects, totalObjects - completedObjects);
+            const serverForecast = item.Forecast || {};
+            const hasServerForecast = typeof serverForecast.available === 'boolean';
+            if (hasServerForecast) {
+                const likelyHours = parseNumber(serverForecast.likelyHours);
+                const basis = String(serverForecast.etaBasis || 'No reliable ETA available');
+                const forecastAgeHours = parseNumber(serverForecast.ageHours);
+                const etaAt = parseDateValue(serverForecast.etaAt);
+                if (!(serverForecast.available && likelyHours !== null && likelyHours > 0)) {
+                    return {
+                        available: false,
+                        likelyHours: null,
+                        bestHours: null,
+                        worstHours: null,
+                        likelyLabel: activeObjects > 0 ? 'No ETA' : 'N/A',
+                        bestLabel: 'N/A',
+                        worstLabel: 'N/A',
+                        etaBasis: basis,
+                        etaAt: null,
+                        ageHours: forecastAgeHours,
+                    };
+                }
+                const issueRate = totalObjects > 0 ? (issueObjects / totalObjects) : 0;
+                const bestHours = Math.max(0.5, likelyHours * 0.82);
+                const worstHours = Math.max(bestHours, likelyHours * (1.22 + Math.min(0.6, issueRate * 3)));
+                return {
+                    available: true,
+                    likelyHours,
+                    bestHours,
+                    worstHours,
+                    likelyLabel: formatEtaCompact(likelyHours),
+                    bestLabel: formatEtaCompact(bestHours),
+                    worstLabel: formatEtaCompact(worstHours),
+                    etaBasis: basis,
+                    etaAt: etaAt || new Date(Date.now() + (likelyHours * 3600000)),
+                    ageHours: forecastAgeHours,
+                };
+            }
             let likelyHours = null;
             let etaBasis = 'No reliable ETA available';
 
@@ -13350,9 +13772,11 @@ class PowerShellSession:
         self.console_visible = False
         self._active_execution_lock = threading.RLock()
         self.active_execution = {}
-        self.worker_root = _runtime_support_dir() / session_id
+        self.session_id = str(session_id or "ps_worker").strip() or "ps_worker"
+        self.worker_root = _worker_root_for_session(self.session_id)
         self.requests_dir = self.worker_root / "requests"
         self.responses_dir = self.worker_root / "responses"
+        self.scripts_dir = self.worker_root / "scripts"
         self.status_path = self.worker_root / "status.json"
         self.worker_script_path = self.worker_root / "quest_worker.ps1"
         # #region agent log
@@ -13368,6 +13792,14 @@ class PowerShellSession:
         if visible is None:
             return bool(self.console_visible)
         return bool(visible)
+
+    def _is_primary_auth_session(self) -> bool:
+        safe_session_id = str(getattr(self, "session_id", "") or "").strip()
+        if safe_session_id:
+            return safe_session_id == "ps_worker"
+        worker_root = getattr(self, "worker_root", None)
+        worker_root_name = str(getattr(worker_root, "name", "") or "").strip()
+        return not worker_root_name or worker_root_name == "ps_worker"
 
     def _worker_script_text(self) -> str:
         return r"""
@@ -13463,23 +13895,81 @@ while ($true) {
 
     def _ensure_worker_paths(self):
         if hasattr(self, "worker_root") and hasattr(self, "requests_dir") and hasattr(self, "responses_dir") and hasattr(self, "status_path") and hasattr(self, "worker_script_path"):
+            if not hasattr(self, "scripts_dir"):
+                self.scripts_dir = Path(self.worker_root) / "scripts"
             return
-        self.worker_root = _runtime_support_dir() / "ps_worker"
+        self.session_id = str(getattr(self, "session_id", "ps_worker") or "ps_worker").strip() or "ps_worker"
+        self.worker_root = _worker_root_for_session(self.session_id)
         self.requests_dir = self.worker_root / "requests"
         self.responses_dir = self.worker_root / "responses"
+        self.scripts_dir = self.worker_root / "scripts"
         self.status_path = self.worker_root / "status.json"
         self.worker_script_path = self.worker_root / "quest_worker.ps1"
+
+    def _terminate_orphaned_worker_processes(self):
+        if os.name != "nt":
+            return
+        script_path = str(getattr(self, "worker_script_path", "") or "").strip()
+        if not script_path:
+            return
+        escaped_script_path = script_path.replace("'", "''")
+        query = (
+            "$ErrorActionPreference = 'Stop'; "
+            f"$scriptPath = '{escaped_script_path}'; "
+            "$pids = @(Get-CimInstance Win32_Process | Where-Object { "
+            "$_.Name -eq 'powershell.exe' -and $_.CommandLine -like ('*' + $scriptPath + '*') "
+            "} | Select-Object -ExpandProperty ProcessId); "
+            "$pids | ConvertTo-Json -Compress"
+        )
+        try:
+            probe = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", query],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except Exception:
+            return
+        if probe.returncode != 0:
+            return
+        payload = str(probe.stdout or "").strip()
+        if not payload:
+            return
+        try:
+            matched = json.loads(payload)
+        except Exception:
+            return
+        if isinstance(matched, int):
+            process_ids = [matched]
+        elif isinstance(matched, list):
+            process_ids = [int(pid) for pid in matched if str(pid).strip().isdigit()]
+        else:
+            process_ids = []
+        for process_id in process_ids:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process_id), "/F", "/T"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except Exception:
+                pass
 
     def _prepare_worker_root(self):
         self._ensure_worker_paths()
         self.requests_dir.mkdir(parents=True, exist_ok=True)
         self.responses_dir.mkdir(parents=True, exist_ok=True)
+        self.scripts_dir.mkdir(parents=True, exist_ok=True)
+        self._terminate_orphaned_worker_processes()
         try:
             self.status_path.unlink(missing_ok=True)
         except TypeError:
             if self.status_path.exists():
                 self.status_path.unlink()
-        for directory in (self.requests_dir, self.responses_dir):
+        for directory in (self.requests_dir, self.responses_dir, self.scripts_dir):
             for item in directory.glob("*"):
                 try:
                     item.unlink()
@@ -13533,25 +14023,21 @@ while ($true) {
 
     def _run_worker_request(self, cmd: str, as_json: bool = True, command_label: str = ""):
         self._ensure_worker_paths()
+        self.requests_dir.mkdir(parents=True, exist_ok=True)
+        self.responses_dir.mkdir(parents=True, exist_ok=True)
+        self.scripts_dir.mkdir(parents=True, exist_ok=True)
         execution_id = uuid.uuid4().hex
         script_path = None
         request_path = None
         response_path = None
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            suffix=".ps1",
-            delete=False,
-        ) as temp_script:
-            temp_script.write(cmd)
-            script_path = temp_script.name
+        script_path = self.scripts_dir / f"{execution_id}.ps1"
+        script_path.write_text(cmd, encoding="utf-8", newline="\n")
         try:
             request_path = self.requests_dir / f"{execution_id}.json"
             response_path = self.responses_dir / f"{execution_id}.json"
             payload = {
                 "requestId": execution_id,
-                "scriptPath": script_path,
+                "scriptPath": str(script_path),
                 "responsePath": str(response_path),
                 "asJson": bool(as_json),
                 "label": str(command_label or "").strip() or "Quest request",
@@ -13600,7 +14086,7 @@ while ($true) {
                         response_path.unlink()
             if script_path:
                 try:
-                    os.remove(script_path)
+                    Path(script_path).unlink(missing_ok=True)
                 except OSError:
                     pass
 
@@ -13609,6 +14095,15 @@ while ($true) {
         if not safe_region or SELFTEST_MODE:
             return False
         self._ensure_worker_paths()
+        if (
+            not self.requests_dir.exists()
+            or not self.responses_dir.exists()
+            or not self.status_path.exists()
+            or self.process is None
+            or self.process.poll() is not None
+            or not isinstance(self.process, subprocess.Popen)
+        ):
+            return False
         ordered_org_ids = []
         seen = set()
         restore_command_builder = globals().get("_ps_silent_rehydrate_command")
@@ -13641,6 +14136,7 @@ while ($true) {
 
     def _restart_process(self, visible: bool | None = None, preserve_auth: bool | None = None):
         resolved_visible = self._resolve_console_visibility(visible)
+        updates_auth_state = self._is_primary_auth_session()
         old_process = self.process
         self.process = None
         self.console_visible = resolved_visible
@@ -13653,10 +14149,10 @@ while ($true) {
         hint_payload = _load_auth_session_hint() if not SELFTEST_MODE else {}
         hint_region = str(hint_payload.get("region") or "").strip().upper()
         hint_org_id = str(hint_payload.get("orgId") or "").strip()
-        if not previous_region and hint_region:
+        if previous_connected and not previous_region and hint_region:
             previous_region = hint_region
         if preserve_auth is None:
-            preserve_auth = bool(previous_region and not SELFTEST_MODE and (previous_connected or bool(hint_region)))
+            preserve_auth = bool(previous_region and not SELFTEST_MODE and previous_connected)
         restart_message = "Quest session was reset. Use 'Entra ID Login' to sign in again."
         candidate_org_ids = ()
         if preserve_auth:
@@ -13696,12 +14192,12 @@ while ($true) {
             restored = False
             if preserve_auth:
                 restored = self._try_restore_authenticated_session(previous_region, candidate_org_ids)
-            if "_set_auth_session_state" in globals():
+            if updates_auth_state and "_set_auth_session_state" in globals():
                 if restored:
                     _set_auth_session_state(True, f"Quest session restored for region [{previous_region}].", previous_region)
                 else:
                     _set_auth_session_state(False, restart_message, previous_region if preserve_auth else "")
-            elif "auth_state_lock" in globals() and "auth_session_state" in globals():
+            elif updates_auth_state and "auth_state_lock" in globals() and "auth_session_state" in globals():
                 with auth_state_lock:
                     auth_session_state.update({
                         "connected": bool(restored),
@@ -13712,7 +14208,7 @@ while ($true) {
             if resolved_visible:
                 _show_process_console(getattr(self.process, "pid", None))
         except Exception:
-            if "_set_auth_session_state" in globals():
+            if updates_auth_state and "_set_auth_session_state" in globals():
                 _set_auth_session_state(False, restart_message, previous_region if preserve_auth else "")
             raise
 
@@ -13742,7 +14238,7 @@ while ($true) {
                 pass
 
     def execute(self, cmd: str, as_json: bool = True, progress_callback=None, progress_key: str | None = None, priority: str = "normal", command_label: str = ""):
-        if self.worker_root.name == "ps_worker" and str(priority or "normal").strip().lower() == "background" and "bg_session" in globals():
+        if self._is_primary_auth_session() and str(priority or "normal").strip().lower() == "background" and "bg_session" in globals():
             return bg_session.execute(cmd, as_json, progress_callback, progress_key, priority, command_label)
         self._ensure_worker_paths()
         wait_started = None
@@ -13823,7 +14319,7 @@ while ($true) {
                         command_label=command_label,
                     )
                 except Exception as exc:
-                    if attempt == 0:
+                    if attempt == 0 and _is_retryable_worker_exception(exc):
                         last_error = exc
                         self._restart_process(visible=self.console_visible or auth_execution, preserve_auth=not auth_execution)
                         continue
@@ -14023,30 +14519,45 @@ def _report_prefix(org_id: str, project_id: str) -> str:
     return f"report:{org_id}:{project_id}:"
 
 
-def _cache_project_catalog(org_id: str, projects) -> list[dict]:
+def _cache_project_catalog(org_id: str, projects, source: str = "live") -> list[dict]:
     safe_org_id = str(org_id or "").strip()
-    payload = [dict(item) for item in (projects or []) if isinstance(item, dict)]
+    payload = _normalise_project_catalog_entries(projects)
     if not safe_org_id:
         return payload
     snapshot = {
         "projects": payload,
         "updated_at": _utc_iso_now(),
+        "source": str(source or "").strip().lower() or "live",
     }
     with project_catalog_lock:
         project_catalog_cache[safe_org_id] = snapshot
+        _save_project_catalog_store(project_catalog_cache)
     return payload
 
 
-def _get_cached_project_catalog(org_id: str, max_age_seconds: float = PROJECT_CATALOG_CACHE_TTL_SECONDS) -> list[dict]:
+def _get_cached_project_catalog(
+    org_id: str,
+    max_age_seconds: float = PROJECT_CATALOG_CACHE_TTL_SECONDS,
+    allow_stale: bool = False,
+    require_live: bool = False,
+) -> list[dict]:
     safe_org_id = str(org_id or "").strip()
     if not safe_org_id:
         return []
     with project_catalog_lock:
         snapshot = dict(project_catalog_cache.get(safe_org_id) or {})
+        if not snapshot:
+            persisted_store = _load_project_catalog_store()
+            if persisted_store:
+                project_catalog_cache.update(persisted_store)
+                snapshot = dict(project_catalog_cache.get(safe_org_id) or {})
     if not snapshot:
         return []
+    source = str(snapshot.get("source") or "").strip().lower()
+    if require_live and source != "live":
+        return []
     age_seconds = _progress_age_seconds(snapshot.get("updated_at"))
-    if max_age_seconds > 0 and age_seconds is not None and age_seconds > max_age_seconds:
+    if (not allow_stale) and max_age_seconds > 0 and age_seconds is not None and age_seconds > max_age_seconds:
         return []
     projects = snapshot.get("projects")
     if not isinstance(projects, list):
@@ -14831,10 +15342,24 @@ def _probe_quest_session(org_id: str, use_cache: bool = True):
             "checked_at": now,
         }
         current_region = str(auth_session_state.get("region") or "").strip().upper()
-    _set_auth_session_state(ok, message, current_region)
+    if ok or _quest_error_requires_reauth(message):
+        _set_auth_session_state(ok, message, current_region)
     if ok:
         _save_auth_session_hint(region=current_region, org_id=safe_org_id)
     return ok, message
+
+
+def _cached_auth_validation_result(org_id: str) -> dict:
+    safe_org_id = str(org_id or "").strip()
+    if not safe_org_id:
+        return {}
+    now = time.monotonic()
+    with auth_state_lock:
+        cached = dict(auth_validation_cache.get(safe_org_id) or {})
+    checked_at = float(cached.get("checked_at") or 0.0)
+    if not cached or (checked_at and now - checked_at > AUTH_VALIDATION_TTL_SECONDS):
+        return {}
+    return cached
 
 
 def _probe_any_quest_session(use_cache: bool = True):
@@ -14938,6 +15463,7 @@ def _set_progress(progress_key: str, status: str, message: str, percent: int | N
 
 
 def _store_progress_result(progress_key: str, status: str, message: str, data, percent: int = 100, error=None):
+    safe_data = _json_safe(copy.deepcopy(data))
     with progress_lock:
         current = progress_state.get(progress_key, {})
         progress_state[progress_key] = {
@@ -14946,7 +15472,7 @@ def _store_progress_result(progress_key: str, status: str, message: str, data, p
             "message": message,
             "percent": percent,
             "updated_at": _utc_iso_now(),
-            "data": _json_safe(copy.deepcopy(data)),
+            "data": safe_data,
             "error": error,
         }
 
@@ -15078,6 +15604,17 @@ def _friendly_quest_error(exc: Exception | str) -> str:
     if "connect to odm to proceed" in normalised:
         return "Quest is not connected. Use 'Entra ID Login' to sign in before loading projects or workloads."
     return message or "Unknown Quest ODM error."
+
+
+def _is_retryable_worker_exception(exc: Exception | str) -> bool:
+    normalised = str(exc or "").strip().lower()
+    if not normalised:
+        return False
+    return (
+        normalised.startswith("fatal:")
+        or "quest worker returned malformed json" in normalised
+        or ("worker bootstrap" in normalised and "quest odm error" in normalised)
+    )
 
 
 def _quest_error_requires_reauth(message: str | None) -> bool:
@@ -15379,6 +15916,7 @@ def _count_by(items, keys):
 
 
 _QUEST_MAILBOX_STATES = (
+    "New",
     "Discovered",
     "Matched",
     "Mapped",
@@ -15394,6 +15932,7 @@ _QUEST_MAILBOX_STATES = (
 )
 
 _QUEST_COLLABORATION_STATES = (
+    "New",
     "Discovered",
     "Matched",
     "Mapped",
@@ -15414,16 +15953,19 @@ _QUEST_COLLABORATION_STATES = (
 
 _QUEST_ONEDRIVE_STATES = (
     "Unknown",
+    "New",
     "Discovery Failed",
     "Discovered",
     "Not Migratable",
+    "Provision Pending",
     "Provisioning",
     "Provisioning Failed",
-    "Provision Pending",
     "Provisioned",
     "Queued",
     "Migrating",
+    "In Progress",
     "Migration Failed",
+    "Migration Stopped",
     "Migrated with Issues",
     "Partially Migrated",
     "Partially Migrated With Issues",
@@ -15449,19 +15991,30 @@ _QUEST_SHAREPOINT_STATES = (
 
 _QUEST_COMPLETED_STATES = {"Migrated", "Migrated with Issues", "Switched"}
 _QUEST_ACTIVE_STATES = {"Migrating", "Provisioning"}
-_QUEST_ISSUE_STATES = {"Migrated with Issues", "Migration Failed", "Migration Stopped"}
-_QUEST_PENDING_STATES = {"Discovered", "Matched", "Mapped", "Queued"}
+_QUEST_ISSUE_STATES = {"Migrated with Issues", "Migration Failed", "Migration Stopped", "Provisioning Failed"}
+_QUEST_PENDING_STATES = {"New", "Discovered", "Matched", "Mapped", "Queued"}
 _QUEST_COLLAB_COMPLETED_STATES = {"Migrated", "Migrated with issues"}
 _QUEST_COLLAB_ACTIVE_STATES = {"Provisioning", "Migrating"}
-_QUEST_COLLAB_ISSUE_STATES = {"Partially migrated", "Partially migrated with issues", "Migrated with issues", "Migration failed", "Migration stopped"}
-_QUEST_COLLAB_PENDING_STATES = {"Discovered", "Matched", "Mapped", "Exists in target", "Provisioned", "Queued"}
-_QUEST_ONEDRIVE_COMPLETED_STATES = {"Migrated", "Migrated with Issues"}
-_QUEST_ONEDRIVE_ACTIVE_STATES = {"Provisioning", "Migrating"}
-_QUEST_ONEDRIVE_ISSUE_STATES = {"Discovery Failed", "Not Migratable", "Migration Failed", "Migrated with Issues", "Partially Migrated", "Partially Migrated With Issues"}
-_QUEST_ONEDRIVE_PENDING_STATES = {"Unknown", "Discovered", "Provision Pending", "Provisioned", "Queued"}
+_QUEST_COLLAB_ISSUE_STATES = {"Provisioned with issues", "Provision failed", "Partially migrated", "Partially migrated with issues", "Migrated with issues", "Migration failed", "Migration stopped"}
+_QUEST_COLLAB_PENDING_STATES = {"New", "Discovered", "Matched", "Mapped", "Exists in target", "Provisioned", "Queued"}
+_QUEST_ONEDRIVE_HEALTHY_COMPLETED_STATES = {"Migrated"}
+_QUEST_ONEDRIVE_COMPLETED_WITH_ISSUES_STATES = {"Migrated with Issues"}
+_QUEST_ONEDRIVE_COMPLETED_STATES = _QUEST_ONEDRIVE_HEALTHY_COMPLETED_STATES | _QUEST_ONEDRIVE_COMPLETED_WITH_ISSUES_STATES
+_QUEST_ONEDRIVE_PARTIAL_STATES = {"Partially Migrated", "Partially Migrated With Issues"}
+_QUEST_ONEDRIVE_ACTIVE_STATES = {"Queued", "Migrating", "In Progress", "Provision Pending", "Provisioning"}
+_QUEST_ONEDRIVE_BLOCKED_STATES = {"Migration Failed", "Provisioning Failed", "Discovery Failed", "Migration Stopped"}
+_QUEST_ONEDRIVE_PREP_STATES = {"New", "Discovered", "Provisioned"}
+_QUEST_ONEDRIVE_EXCEPTION_STATES = {"Unknown", "Not Migratable"}
+_QUEST_ONEDRIVE_ISSUE_STATES = (
+    _QUEST_ONEDRIVE_COMPLETED_WITH_ISSUES_STATES
+    | _QUEST_ONEDRIVE_PARTIAL_STATES
+    | _QUEST_ONEDRIVE_BLOCKED_STATES
+    | _QUEST_ONEDRIVE_EXCEPTION_STATES
+)
+_QUEST_ONEDRIVE_PENDING_STATES = _QUEST_ONEDRIVE_PREP_STATES
 _QUEST_SHAREPOINT_COMPLETED_STATES = {"Migrated", "Migrated With Issues"}
 _QUEST_SHAREPOINT_ACTIVE_STATES = {"Migrating"}
-_QUEST_SHAREPOINT_ISSUE_STATES = {"Migration Failed", "Migration Stopped", "Migrated With Issues", "Partially Migrated", "Partially Migrated With Issues"}
+_QUEST_SHAREPOINT_ISSUE_STATES = {"Provisioned With Issues", "Migration Failed", "Migration Stopped", "Migrated With Issues", "Partially Migrated", "Partially Migrated With Issues"}
 _QUEST_SHAREPOINT_PENDING_STATES = {"Not Migrated", "Discovered", "Matched", "Mapped", "Provisioned", "Queued"}
 _QUEST_WARNING_STATES = {
     "Migrated with Issues",
@@ -15486,6 +16039,11 @@ _QUEST_DANGER_STATES = {
     "Load Failed",
     "Failed",
 }
+
+_ONEDRIVE_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+ONEDRIVE_EXCLUDE_NOT_MIGRATABLE_FROM_SCOPE_DEFAULT = str(
+    os.environ.get("ODM_ONEDRIVE_EXCLUDE_NOT_MIGRATABLE_FROM_SCOPE", "0")
+).strip().lower() in _ONEDRIVE_TRUE_VALUES
 
 
 def _order_breakdown(breakdown: dict | None, preferred_order, include_missing: bool = False) -> dict:
@@ -15538,7 +16096,6 @@ def _normalise_quest_mailbox_state_label(label: str | None) -> str | None:
         return None
     text = str(label).strip()
     return {
-        "New": "Discovered",
         "Completed": "Migrated",
         "Completed with Issues": "Migrated with Issues",
         "Failed": "Migration Failed",
@@ -15562,7 +16119,6 @@ def _normalise_quest_collaboration_state_label(label: str | None) -> str | None:
         return None
     text = str(label).strip()
     return {
-        "New": "Discovered",
         "Exists In Target": "Exists in target",
         "Provisioned With Issues": "Provisioned with issues",
         "Provision Failed": "Provision failed",
@@ -15592,22 +16148,32 @@ def _normalise_quest_onedrive_state_label(label: str | None) -> str | None:
     if label is None:
         return None
     text = str(label).strip()
-    return {
+    mapped = {
         "": "Unknown",
-        "New": "Unknown",
-        "Completed": "Migrated",
-        "Completed with Issues": "Migrated with Issues",
-        "Failed": "Migration Failed",
-        "In Progress": "Migrating",
-        "Discovery failed": "Discovery Failed",
-        "Not migratable": "Not Migratable",
-        "Provision pending": "Provision Pending",
-        "Provisioned": "Provisioned",
-        "Provisioning failed": "Provisioning Failed",
-        "Migrated With Issues": "Migrated with Issues",
-        "Partially Migrated": "Partially Migrated",
-        "Partially Migrated With Issues": "Partially Migrated With Issues",
-    }.get(text, text)
+        "unknown": "Unknown",
+        "new": "New",
+        "completed": "Migrated",
+        "completed with issues": "Migrated with Issues",
+        "failed": "Migration Failed",
+        "stopped": "Migration Stopped",
+        "in progress": "In Progress",
+        "discovery failed": "Discovery Failed",
+        "not migratable": "Not Migratable",
+        "provision pending": "Provision Pending",
+        "provisioned": "Provisioned",
+        "provisioning": "Provisioning",
+        "provisioning failed": "Provisioning Failed",
+        "queued": "Queued",
+        "migrating": "Migrating",
+        "migration failed": "Migration Failed",
+        "migration stopped": "Migration Stopped",
+        "migrated with issues": "Migrated with Issues",
+        "partially migrated": "Partially Migrated",
+        "partially migrated with issues": "Partially Migrated With Issues",
+        "migrated": "Migrated",
+        "discovered": "Discovered",
+    }
+    return mapped.get(text.casefold(), text)
 
 
 def _to_quest_onedrive_state_breakdown(breakdown: dict | None, include_missing: bool = False) -> dict:
@@ -15625,7 +16191,6 @@ def _normalise_quest_sharepoint_state_label(label: str | None) -> str | None:
         return None
     text = str(label).strip()
     return {
-        "New": "Not Migrated",
         "Completed": "Migrated",
         "Completed with Issues": "Migrated With Issues",
         "Failed": "Migration Failed",
@@ -15685,7 +16250,7 @@ def _classify_status(label: str) -> str:
         )
         or ""
     )
-    if text in (_QUEST_PENDING_STATES | _QUEST_COLLAB_PENDING_STATES | _QUEST_ONEDRIVE_PENDING_STATES | _QUEST_SHAREPOINT_PENDING_STATES):
+    if text in (_QUEST_PENDING_STATES | _QUEST_COLLAB_PENDING_STATES | _QUEST_ONEDRIVE_PENDING_STATES | _QUEST_SHAREPOINT_PENDING_STATES | {"New"}):
         return "pending"
     if text in {"Migrating", "Provisioning", "In Progress"}:
         return "active"
@@ -15696,7 +16261,6 @@ def _classify_status(label: str) -> str:
     if text in {
         "Migrated with Issues",
         "Migration Failed",
-        "Migration Stopped",
         "Migration Stopped",
         "Provisioning Failed",
         "Provisioned with issues",
@@ -15831,7 +16395,7 @@ def _detail_count_label(display_type: str | None) -> str:
         "M365 Groups": "Groups Queried",
         "Distribution Groups": "Distribution Groups Queried",
         "Chats": "Users Queried",
-        "SharePoint": "SharePoint Objects Queried",
+        "SharePoint": "SharePoint Sites Queried",
         "Accounts": "Accounts Queried",
     }.get(label, "Objects Queried")
 
@@ -15839,12 +16403,19 @@ def _detail_count_label(display_type: str | None) -> str:
 def _infer_total_objects(summary: dict, status_breakdown: dict | None = None) -> int:
     details = summary.get("Details") or {}
     stats = summary.get("Statistics") or {}
+    display_type = str(summary.get("DisplayType") or summary.get("Type") or "").strip().lower()
+    if display_type == "sharepoint":
+        for value in (details.get("SharePoint Sites Queried"), stats.get("Sites")):
+            parsed = _parse_number(value)
+            if parsed is not None:
+                return int(parsed)
     candidates = [
         *[value for key, value in details.items() if isinstance(key, str) and key.endswith("Queried")],
         stats.get("Mailboxes"),
         stats.get("Archive Mailboxes"),
         stats.get("Accounts"),
         stats.get("Users"),
+        stats.get("Sites"),
         stats.get("Objects"),
         stats.get("Teams"),
         stats.get("Groups"),
@@ -15857,6 +16428,137 @@ def _infer_total_objects(summary: dict, status_breakdown: dict | None = None) ->
     if status_breakdown:
         return int(sum(int(count) for count in status_breakdown.values()))
     return 0
+
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in _ONEDRIVE_TRUE_VALUES:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _onedrive_exclude_not_migratable_from_scope(summary: dict | None = None) -> bool:
+    summary = summary if isinstance(summary, dict) else {}
+    details = summary.get("Details") or {}
+    stats = summary.get("Statistics") or {}
+    candidates = (
+        details.get("Exclude Not Migratable From Scope"),
+        details.get("ExcludeNotMigratableFromScope"),
+        stats.get("Exclude Not Migratable From Scope"),
+        summary.get("excludeNotMigratableFromScope"),
+    )
+    for candidate in candidates:
+        parsed = _parse_bool(candidate)
+        if parsed is not None:
+            return parsed
+    return ONEDRIVE_EXCLUDE_NOT_MIGRATABLE_FROM_SCOPE_DEFAULT
+
+
+def _build_onedrive_progress_metrics(status_breakdown: dict | None, *, exclude_not_migratable_from_scope: bool = False) -> dict:
+    ordered_breakdown = _to_quest_onedrive_state_breakdown(status_breakdown, include_missing=True)
+    raw_total = sum(int(_parse_number(value) or 0) for value in ordered_breakdown.values())
+    not_migratable = int(ordered_breakdown.get("Not Migratable", 0) or 0)
+    in_scope_total = max(0, raw_total - not_migratable) if exclude_not_migratable_from_scope else raw_total
+
+    def _bucket_total(labels: set[str]) -> int:
+        return sum(int(ordered_breakdown.get(label, 0) or 0) for label in labels)
+
+    healthy_completed = _bucket_total(_QUEST_ONEDRIVE_HEALTHY_COMPLETED_STATES)
+    completed_with_issues = _bucket_total(_QUEST_ONEDRIVE_COMPLETED_WITH_ISSUES_STATES)
+    completed = healthy_completed + completed_with_issues
+    partial = _bucket_total(_QUEST_ONEDRIVE_PARTIAL_STATES)
+    active = _bucket_total(_QUEST_ONEDRIVE_ACTIVE_STATES)
+    blocked = _bucket_total(_QUEST_ONEDRIVE_BLOCKED_STATES)
+    not_started = _bucket_total(_QUEST_ONEDRIVE_PREP_STATES)
+    exception = _bucket_total(_QUEST_ONEDRIVE_EXCEPTION_STATES)
+    if exclude_not_migratable_from_scope:
+        exception = max(0, exception - not_migratable)
+
+    def _percent(count: int) -> float:
+        return (count / in_scope_total) * 100 if in_scope_total else 0.0
+
+    progress_metrics = {
+        "rawTotalObjects": raw_total,
+        "inScopeTotal": in_scope_total,
+        "excludedNotMigratableCount": not_migratable if exclude_not_migratable_from_scope else 0,
+        "excludeNotMigratableFromScope": exclude_not_migratable_from_scope,
+        "healthyCompletedObjects": healthy_completed,
+        "completedWithIssuesObjects": completed_with_issues,
+        "completedObjects": completed,
+        "partialObjects": partial,
+        "activeObjects": active,
+        "blockedObjects": blocked,
+        "notStartedObjects": not_started,
+        "exceptionObjects": exception,
+        "healthyCompletionPercent": _percent(healthy_completed),
+        "completedWithIssuesPercent": _percent(completed_with_issues),
+        "completionPercent": _percent(completed),
+        "partialPercent": _percent(partial),
+        "activePercent": _percent(active),
+        "blockedPercent": _percent(blocked),
+        "notStartedPercent": _percent(not_started),
+        "exceptionPercent": _percent(exception),
+    }
+    progress_metrics["issueObjects"] = (
+        progress_metrics["completedWithIssuesObjects"]
+        + progress_metrics["partialObjects"]
+        + progress_metrics["blockedObjects"]
+        + progress_metrics["exceptionObjects"]
+    )
+    progress_metrics["pendingObjects"] = progress_metrics["notStartedObjects"]
+    scope_label = (
+        "In-scope users exclude 'Not Migratable'."
+        if exclude_not_migratable_from_scope
+        else "In-scope users include 'Not Migratable'."
+    )
+    progress_metrics["scopeNote"] = scope_label
+    progress_metrics["completionNote"] = (
+        "Completed % = (Migrated + Migrated with Issues) / in-scope OneDrive users. "
+        + scope_label
+    )
+    progress_metrics["completedCountNote"] = (
+        f"{completed:,} finished users across {in_scope_total:,} in-scope users. "
+        "Finished means Migrated plus Migrated with Issues."
+    )
+    progress_metrics["segments"] = [
+        {"label": "Healthy Completion", "value": healthy_completed, "percent": progress_metrics["healthyCompletionPercent"], "tone": "tone-success", "valueLabel": f"{healthy_completed:,} users"},
+        {"label": "Completed with Issues", "value": completed_with_issues, "percent": progress_metrics["completedWithIssuesPercent"], "tone": "tone-warning", "valueLabel": f"{completed_with_issues:,} users"},
+        {"label": "Partial", "value": partial, "percent": progress_metrics["partialPercent"], "tone": "tone-warning", "valueLabel": f"{partial:,} users"},
+        {"label": "Active", "value": active, "percent": progress_metrics["activePercent"], "tone": "tone-accent", "valueLabel": f"{active:,} users"},
+        {"label": "Blocked", "value": blocked, "percent": progress_metrics["blockedPercent"], "tone": "tone-danger", "valueLabel": f"{blocked:,} users"},
+        {"label": "Not Started / Prep", "value": not_started, "percent": progress_metrics["notStartedPercent"], "tone": "tone-neutral", "valueLabel": f"{not_started:,} users"},
+        {"label": "Exception", "value": exception, "percent": progress_metrics["exceptionPercent"], "tone": "tone-neutral", "valueLabel": f"{exception:,} users"},
+    ]
+    progress_metrics["supplementalMetrics"] = [
+        {"label": "Healthy Completion", "percent": progress_metrics["healthyCompletionPercent"], "count": healthy_completed, "tone": "tone-success", "note": "Migrated / in-scope users"},
+        {"label": "Completed with Issues", "percent": progress_metrics["completedWithIssuesPercent"], "count": completed_with_issues, "tone": "tone-warning", "note": "Migrated with Issues / in-scope users"},
+        {"label": "Partial", "percent": progress_metrics["partialPercent"], "count": partial, "tone": "tone-warning", "note": "Partially Migrated states / in-scope users"},
+        {"label": "Active", "percent": progress_metrics["activePercent"], "count": active, "tone": "tone-accent", "note": "Queued, Migrating, In Progress, Provision Pending, Provisioning / in-scope users"},
+        {"label": "Blocked", "percent": progress_metrics["blockedPercent"], "count": blocked, "tone": "tone-danger", "note": "Failed, stopped, discovery, or provisioning failures / in-scope users"},
+        {"label": "Not Started / Prep", "percent": progress_metrics["notStartedPercent"], "count": not_started, "tone": "tone-neutral", "note": "New, Discovered, or Provisioned / in-scope users"},
+        {"label": "Exception", "percent": progress_metrics["exceptionPercent"], "count": exception, "tone": "tone-neutral", "note": "Unknown and exception-state users in scope"},
+    ]
+    progress_metrics["bucketBreakdown"] = {
+        "complete": completed,
+        "active": active,
+        "pending": not_started,
+        "issues": progress_metrics["issueObjects"],
+        "healthyCompleted": healthy_completed,
+        "completedWithIssues": completed_with_issues,
+        "partial": partial,
+        "blocked": blocked,
+        "notStarted": not_started,
+        "exception": exception,
+    }
+    return progress_metrics
 
 
 def _infer_source_bytes(summary: dict) -> float | None:
@@ -15906,8 +16608,12 @@ def _build_status_segments(breakdown: dict | None, total_objects: int) -> list[d
 
 def _build_workload_overview(summary: dict) -> dict:
     status_breakdown = summary.get("StatusBreakdown") or {}
+    display_type = str(summary.get("DisplayType") or summary.get("Type") or "").strip().lower()
     total_objects = _infer_total_objects(summary, status_breakdown=status_breakdown)
     completed = active = pending = issues = 0
+    donut_segments = _build_status_segments(status_breakdown, total_objects)
+    supplemental_metrics = []
+    onedrive_progress_metrics = summary.get("OneDriveProgressMetrics") if isinstance(summary.get("OneDriveProgressMetrics"), dict) else {}
 
     if _is_quest_mailbox_state_breakdown(status_breakdown):
         completed = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_COMPLETED_STATES)
@@ -15920,10 +16626,20 @@ def _build_workload_overview(summary: dict) -> dict:
         pending = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_COLLAB_PENDING_STATES)
         issues = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_COLLAB_ISSUE_STATES)
     elif _is_quest_onedrive_state_breakdown(status_breakdown):
-        completed = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_ONEDRIVE_COMPLETED_STATES)
-        active = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_ONEDRIVE_ACTIVE_STATES)
-        pending = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_ONEDRIVE_PENDING_STATES)
-        issues = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_ONEDRIVE_ISSUE_STATES)
+        onedrive_metrics = onedrive_progress_metrics
+        if not onedrive_metrics:
+            onedrive_metrics = _build_onedrive_progress_metrics(
+                status_breakdown,
+                exclude_not_migratable_from_scope=_onedrive_exclude_not_migratable_from_scope(summary),
+            )
+            onedrive_progress_metrics = onedrive_metrics
+        total_objects = int(onedrive_metrics.get("inScopeTotal") or 0)
+        completed = int(onedrive_metrics.get("completedObjects") or 0)
+        active = int(onedrive_metrics.get("activeObjects") or 0)
+        pending = int(onedrive_metrics.get("pendingObjects") or 0)
+        issues = int(onedrive_metrics.get("issueObjects") or 0)
+        donut_segments = list(onedrive_metrics.get("segments") or [])
+        supplemental_metrics = list(onedrive_metrics.get("supplementalMetrics") or [])
     elif _is_quest_sharepoint_state_breakdown(status_breakdown):
         completed = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_SHAREPOINT_COMPLETED_STATES)
         active = sum(int(status_breakdown.get(label, 0)) for label in _QUEST_SHAREPOINT_ACTIVE_STATES)
@@ -15941,23 +16657,84 @@ def _build_workload_overview(summary: dict) -> dict:
     stats = summary.get("Statistics") or {}
     details = summary.get("Details") or {}
     migrated_bytes = _direct_migrated_bytes(summary)
-    source_bytes = _infer_source_bytes(summary)
     throughput_bytes_per_hour = _parse_number(stats.get("Average Throughput (bytes/hour)"))
     task_hours = _parse_number(details.get("Task Runtime Hours"))
-    object_completion_percent = round((completed / total_objects) * 100, 1) if total_objects else 0
-    migrated_estimated = str(details.get("Migrated Data Accuracy", "")).strip().lower().startswith("estimated")
-    completion_basis = "objects"
-    completion_percent = object_completion_percent
-    
-    is_volume_workload = (
-        _is_quest_onedrive_state_breakdown(status_breakdown) or 
-        _is_quest_sharepoint_state_breakdown(status_breakdown)
+    status_completion_percent = round((completed / total_objects) * 100, 1) if total_objects else 0
+    source_bytes = (
+        _parse_number(stats.get("Source Mailbox Size (bytes)"))
+        or _parse_number(stats.get("Archive Size (bytes)"))
+        or _parse_number(stats.get("Source Size (bytes)"))
+        or _parse_number(stats.get("Source Data (bytes)"))
+        or _parse_number(stats.get("Source Total Size (bytes)"))
     )
-    
-    if migrated_bytes is not None and source_bytes is not None and float(source_bytes) > 0:
-        if not migrated_estimated or is_volume_workload:
-            completion_percent = min(100.0, round((float(migrated_bytes) / float(source_bytes)) * 100, 1))
-            completion_basis = "volume"
+    remaining_bytes = None
+    completion_percent = status_completion_percent
+    completion_basis = "status"
+    completion_label = "Completion"
+    completed_count_label = "Completed"
+    status_completion_label = completion_label
+    completion_note = "Completion based on Quest object states."
+    donut_caption = "complete"
+    completed_count_note = f"{completed:,} completed across {total_objects:,} scoped objects." if total_objects else "No scoped objects returned by Quest."
+
+    if display_type == "onedrive":
+        onedrive_metrics = onedrive_progress_metrics
+        if not onedrive_metrics:
+            onedrive_metrics = _build_onedrive_progress_metrics(
+                status_breakdown,
+                exclude_not_migratable_from_scope=_onedrive_exclude_not_migratable_from_scope(summary),
+            )
+            onedrive_progress_metrics = onedrive_metrics
+        total_objects = int(onedrive_metrics.get("inScopeTotal") or 0)
+        completed = int(onedrive_metrics.get("completedObjects") or 0)
+        active = int(onedrive_metrics.get("activeObjects") or 0)
+        pending = int(onedrive_metrics.get("pendingObjects") or 0)
+        issues = int(onedrive_metrics.get("issueObjects") or 0)
+        completion_percent = round(float(onedrive_metrics.get("completionPercent") or 0), 1)
+        status_completion_percent = round(float(onedrive_metrics.get("healthyCompletionPercent") or 0), 1)
+        completion_label = "Completed"
+        completed_count_label = "Users finished"
+        status_completion_label = "Healthy completion"
+        completion_note = str(onedrive_metrics.get("completionNote") or "Completed % uses only finished OneDrive users.")
+        completed_count_note = str(onedrive_metrics.get("completedCountNote") or completed_count_note)
+        donut_caption = "complete"
+        donut_segments = list(onedrive_metrics.get("segments") or [])
+        supplemental_metrics = list(onedrive_metrics.get("supplementalMetrics") or [])
+        if source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+            remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
+    elif display_type in {"mailboxes", "archive mailboxes"}:
+        completion_label = "Mailbox status completion"
+        status_completion_label = completion_label
+        completed_count_label = "Mailboxes completed" if display_type == "mailboxes" else "Archive mailboxes completed"
+        donut_caption = "mailboxes complete" if display_type == "mailboxes" else "archive mailboxes complete"
+        completion_note = "Completion based on live Quest mailbox states. 'Migrated with Issues' remains finished for progress and flagged separately for quality."
+    elif display_type == "teams":
+        completion_label = "Team status completion"
+        completed_count_label = "Teams completed"
+        status_completion_label = completion_label
+        completion_note = "Completion based on live Quest Team migration states. Quest target content size telemetry is shown separately and is not used for completion because it does not align reliably with scoped Team status."
+        donut_caption = "teams complete"
+        if source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+            remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
+    elif display_type == "m365 groups":
+        completion_label = "Group status completion"
+        completed_count_label = "Groups completed"
+        status_completion_label = completion_label
+        completion_note = "Completion based on live Quest M365 Group migration states. Quest target content size telemetry is shown separately and is not used for completion because it does not align reliably with scoped Group status."
+        donut_caption = "groups complete"
+        if source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+            remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
+    elif display_type == "sharepoint":
+        completion_label = "SharePoint site completion"
+        status_completion_label = completion_label
+        completed_count_label = "SharePoint sites completed"
+        completion_note = "Completion based on live Quest SharePoint site migration states. Partial and failed states remain outside the main completion numerator."
+        completed_count_note = f"{completed:,} completed sites across {total_objects:,} scoped SharePoint sites." if total_objects else "No scoped SharePoint sites returned by Quest."
+        donut_caption = "sites complete"
+        if source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+            remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
+    elif source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+        remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
 
     return {
         "totalObjects": total_objects,
@@ -15966,20 +16743,81 @@ def _build_workload_overview(summary: dict) -> dict:
         "pendingObjects": pending,
         "issueObjects": issues,
         "completionPercent": completion_percent,
-        "objectCompletionPercent": object_completion_percent,
+        "statusCompletionPercent": status_completion_percent,
         "completionBasis": completion_basis,
-        "sourceBytes": source_bytes,
+        "completionLabel": completion_label,
+        "statusCompletionLabel": status_completion_label,
+        "completedCountLabel": completed_count_label,
+        "completedCountNote": completed_count_note,
+        "completionNote": completion_note,
+        "donutCaption": donut_caption,
         "migratedBytes": migrated_bytes,
-        "migratedBytesEstimated": migrated_estimated,
+        "migratedBytesEstimated": str(details.get("Migrated Data Accuracy", "")).strip().lower().startswith("estimated"),
+        "sourceBytes": source_bytes,
+        "remainingBytes": remaining_bytes,
         "throughputBytesPerHour": throughput_bytes_per_hour,
         "taskHours": task_hours,
         "taskState": details.get("Task Runtime State"),
         "statusTone": _status_tone(summary.get("DisplayStatus") or summary.get("Status")),
-        "segments": _build_status_segments(status_breakdown, total_objects),
+        "segments": donut_segments,
+        "supplementalMetrics": supplemental_metrics,
+        "excludeNotMigratableFromScope": bool(onedrive_progress_metrics.get("excludeNotMigratableFromScope")),
+        "healthyCompletedObjects": int(onedrive_progress_metrics.get("healthyCompletedObjects") or 0),
+        "completedWithIssuesObjects": int(onedrive_progress_metrics.get("completedWithIssuesObjects") or 0),
+        "partialObjects": int(onedrive_progress_metrics.get("partialObjects") or 0),
+        "blockedObjects": int(onedrive_progress_metrics.get("blockedObjects") or 0),
+        "notStartedObjects": int(onedrive_progress_metrics.get("notStartedObjects") or 0),
+        "exceptionObjects": int(onedrive_progress_metrics.get("exceptionObjects") or 0),
+        "completedWithIssuesPercent": round(float(onedrive_progress_metrics.get("completedWithIssuesPercent") or 0), 1),
+        "partialPercent": round(float(onedrive_progress_metrics.get("partialPercent") or 0), 1),
+        "activePercent": round(float(onedrive_progress_metrics.get("activePercent") or 0), 1),
+        "blockedPercent": round(float(onedrive_progress_metrics.get("blockedPercent") or 0), 1),
+        "notStartedPercent": round(float(onedrive_progress_metrics.get("notStartedPercent") or 0), 1),
+        "exceptionPercent": round(float(onedrive_progress_metrics.get("exceptionPercent") or 0), 1),
+        "bucketBreakdown": (
+            dict(onedrive_progress_metrics.get("bucketBreakdown") or {})
+            if display_type == "onedrive"
+            else {
+                "complete": completed,
+                "active": active,
+                "pending": pending,
+                "issues": issues,
+            }
+        ),
     }
 
 
 def _backfill_onedrive_metrics(summary: dict) -> dict:
+    summary = dict(summary or {})
+    display_type = str(summary.get("DisplayType") or summary.get("Type") or "").strip().lower()
+    if display_type != "onedrive":
+        return summary
+
+    status_breakdown = summary.get("StatusBreakdown") or {}
+    if not _is_quest_onedrive_state_breakdown(status_breakdown):
+        return summary
+
+    metrics = _build_onedrive_progress_metrics(
+        status_breakdown,
+        exclude_not_migratable_from_scope=_onedrive_exclude_not_migratable_from_scope(summary),
+    )
+    summary["OneDriveProgressMetrics"] = metrics
+
+    stats = dict(summary.get("Statistics") or {})
+    details = dict(summary.get("Details") or {})
+    stats["Finished Users"] = metrics["completedObjects"]
+    stats["Healthy Completion (%)"] = round(metrics["healthyCompletionPercent"], 2)
+    stats["Completed with Issues (%)"] = round(metrics["completedWithIssuesPercent"], 2)
+    stats["Partial (%)"] = round(metrics["partialPercent"], 2)
+    stats["Active (%)"] = round(metrics["activePercent"], 2)
+    stats["Blocked (%)"] = round(metrics["blockedPercent"], 2)
+    stats["Not Started / Prep (%)"] = round(metrics["notStartedPercent"], 2)
+    stats["Exception (%)"] = round(metrics["exceptionPercent"], 2)
+    details["Completion Metric"] = "Completed % = (Migrated + Migrated with Issues) / in-scope OneDrive users"
+    details["Healthy Completion Metric"] = "Healthy completion = Migrated / in-scope OneDrive users"
+    details["OneDrive Scope Policy"] = metrics["scopeNote"]
+    summary["Statistics"] = stats
+    summary["Details"] = details
     return summary
 
 
@@ -16572,6 +17410,137 @@ def _trend_change_summary(history_entries: list[dict], field: str) -> dict:
     return {"direction": direction, "delta": delta, "available": True}
 
 
+def _forecast_reference_dt(summary: dict, freshness: dict):
+    details = summary.get("Details") or {}
+    for value in (
+        details.get("Task Runtime Updated"),
+        freshness.get("lastLiveRefreshAt"),
+    ):
+        parsed = _parse_history_iso(value)
+        if parsed is not None:
+            return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _recent_history_points(history_entries: list[dict], *, max_age_hours: float = 72, max_points: int = 8):
+    parsed_points = []
+    for entry in history_entries or []:
+        captured_at = _parse_history_iso(entry.get("capturedAt"))
+        if captured_at is None:
+            continue
+        point_dt = captured_at.astimezone(timezone.utc) if captured_at.tzinfo else captured_at.replace(tzinfo=timezone.utc)
+        parsed_points.append((point_dt, entry))
+    if not parsed_points:
+        return []
+    latest_dt = parsed_points[-1][0]
+    cutoff_dt = latest_dt - timedelta(hours=max_age_hours)
+    recent = [(point_dt, entry) for point_dt, entry in parsed_points if point_dt >= cutoff_dt]
+    return recent[-max_points:]
+
+
+def _latest_positive_history_rate(history_entries: list[dict], value_resolver, *, max_age_hours: float = 72, max_points: int = 8):
+    recent_points = _recent_history_points(history_entries, max_age_hours=max_age_hours, max_points=max_points)
+    if len(recent_points) < 2:
+        return None
+    for index in range(len(recent_points) - 1, 0, -1):
+        current_dt, current_entry = recent_points[index]
+        previous_dt, previous_entry = recent_points[index - 1]
+        elapsed_hours = (current_dt - previous_dt).total_seconds() / 3600
+        if elapsed_hours <= 0:
+            continue
+        current_value = value_resolver(current_entry)
+        previous_value = value_resolver(previous_entry)
+        if current_value is None or previous_value is None:
+            continue
+        try:
+            delta = float(current_value) - float(previous_value)
+        except (TypeError, ValueError):
+            continue
+        if delta > 0:
+            return delta / elapsed_hours
+    return None
+
+
+def _build_workload_forecast(summary: dict, history_entries: list[dict], freshness: dict):
+    overview = summary.get("Overview") or {}
+    details = summary.get("Details") or {}
+    display_type = str(summary.get("DisplayType") or summary.get("Type") or "").strip().lower()
+    total_objects = int(_parse_number(overview.get("totalObjects")) or 0)
+    completed_objects = int(_parse_number(overview.get("completedObjects")) or 0)
+    active_objects = int(_parse_number(overview.get("activeObjects")) or 0)
+    pending_objects = int(_parse_number(overview.get("pendingObjects")) or 0)
+    remaining_objects = max(0, max(pending_objects, total_objects - completed_objects))
+    throughput_bytes_per_hour = _parse_number(overview.get("throughputBytesPerHour"))
+    task_hours = _parse_number(overview.get("taskHours"))
+    task_state = str(details.get("Task Runtime State") or overview.get("taskState") or summary.get("DisplayStatus") or "").strip().lower()
+    task_looks_terminal = any(token in task_state for token in ("completed", "stopped", "failed")) and "issue" not in task_state
+    reference_dt = _forecast_reference_dt(summary, freshness or {})
+    age_hours = None
+    if reference_dt is not None:
+        age_hours = max(0.0, (_utc_now() - reference_dt).total_seconds() / 3600)
+
+    unavailable = {
+        "available": False,
+        "likelyHours": None,
+        "etaAt": None,
+        "etaBasis": "No reliable ETA available",
+        "ageHours": age_hours,
+    }
+    if active_objects <= 0:
+        return unavailable
+    if reference_dt is None or age_hours is None or age_hours > 72 or task_looks_terminal:
+        return unavailable
+
+    source_bytes = _parse_number(overview.get("sourceBytes"))
+    remaining_bytes = _parse_number(overview.get("remainingBytes"))
+    if remaining_bytes is None and source_bytes is not None:
+        migrated_bytes = _direct_migrated_bytes(summary)
+        if migrated_bytes is not None:
+            remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
+    volume_aligned = display_type in {"mailboxes", "archive mailboxes", "onedrive"} or str(overview.get("completionBasis") or "").strip().lower() == "volume"
+
+    likely_hours = None
+    eta_basis = "No reliable ETA available"
+    if volume_aligned and remaining_bytes is not None and remaining_bytes > 0 and not _migrated_data_is_estimated(summary):
+        volume_rate = _latest_positive_history_rate(history_entries, _history_direct_migrated_bytes)
+        if volume_rate is not None and volume_rate > 0:
+            likely_hours = float(remaining_bytes) / float(volume_rate)
+            eta_basis = "Estimated from recent migrated-volume trend"
+    if likely_hours is None and remaining_objects > 0:
+        object_rate = _latest_positive_history_rate(history_entries, lambda entry: _parse_number(entry.get("completedObjects")))
+        if object_rate is not None and object_rate > 0:
+            likely_hours = remaining_objects / float(object_rate)
+            eta_basis = "Estimated from recent object trend"
+    if (
+        likely_hours is None
+        and volume_aligned
+        and throughput_bytes_per_hour is not None
+        and throughput_bytes_per_hour > 0
+        and remaining_bytes is not None
+        and remaining_bytes > 0
+        and not _migrated_data_is_estimated(summary)
+        and (active_objects > 0 or pending_objects > 0)
+    ):
+        likely_hours = float(remaining_bytes) / float(throughput_bytes_per_hour)
+        eta_basis = "Estimated from current throughput"
+    if likely_hours is None and task_hours is not None and task_hours > 0 and completed_objects > 0 and remaining_objects > 0 and task_hours <= 168:
+        object_rate = completed_objects / task_hours
+        if object_rate > 0:
+            likely_hours = remaining_objects / object_rate
+            eta_basis = "Estimated from current object cadence"
+
+    if likely_hours is None or likely_hours <= 0:
+        return unavailable
+    eta_at = _utc_now() + timedelta(hours=float(likely_hours))
+    return {
+        "available": True,
+        "likelyHours": round(float(likely_hours), 2),
+        "etaAt": eta_at.isoformat().replace("+00:00", "Z"),
+        "etaBasis": eta_basis,
+        "ageHours": round(float(age_hours), 2) if age_hours is not None else None,
+    }
+
+
 def _build_delta_payload(summary: dict, history_entries: list[dict]):
     current_entry = _make_workload_history_entry(summary, summary.get("SourceStream") or "exchange")
     previous_entry = None
@@ -16816,7 +17785,7 @@ def _build_freshness_payload(summary: dict, history_entries: list[dict], respons
 def _decorate_workload_payload(org_id: str, project_id: str, stream: str, summaries: list[dict], response_source: str = "cache"):
     decorated = []
     for raw_summary in summaries or []:
-        summary = copy.deepcopy(raw_summary)
+        summary = _enrich_summary_for_ui(copy.deepcopy(raw_summary))
         summary["SourceStream"] = _normalise_stream(stream)
         display_type = str(summary.get("DisplayType") or summary.get("Type") or "").strip()
         history_entries = _get_workload_history_entries(org_id, project_id, display_type)
@@ -16824,6 +17793,7 @@ def _decorate_workload_payload(org_id: str, project_id: str, stream: str, summar
         summary["Freshness"] = freshness
         summary["Delta"] = _build_delta_payload(summary, history_entries)
         summary["Trend"] = _build_trend_payload(history_entries)
+        summary["Forecast"] = _build_workload_forecast(summary, history_entries, freshness)
         summary["ForecastConfidence"] = _build_forecast_confidence(summary, history_entries, freshness)
         summary["Readiness"] = _build_cutover_readiness(summary, history_entries)
         decorated.append(summary)
@@ -17014,7 +17984,7 @@ def _build_accounts_summaries(workload: dict, objects: list):
 
     onedrive_objects = [
         item for item in objects
-        if _has_any_value(item, ("OneDriveStatus", "OneDriveMigrationState", "OneDriveSourceFileCount", "OneDriveSourceItemCount", "OneDriveTargetItemCount", "OneDriveSourceTotalSize"))
+        if _has_any_value(item, ("OneDriveStatus", "OneDriveMigrationState", "OneDriveSourceFileCount", "OneDriveSourceItemCount", "OneDriveTargetItemCount", "OneDriveSourceTotalSize", "OneDriveTargetTotalSize"))
     ]
     if onedrive_objects:
         onedrive_state_breakdown = _to_quest_onedrive_state_breakdown(_count_by(onedrive_objects, ("OneDriveMigrationState",)), include_missing=True)
@@ -17023,49 +17993,64 @@ def _build_accounts_summaries(workload: dict, objects: list):
             merged = dict(onedrive_state_breakdown)
             merged["Unknown"] = merged.get("Unknown", 0) + missing_onedrive_states
             onedrive_state_breakdown = _order_breakdown(merged, _QUEST_ONEDRIVE_STATES, include_missing=True)
+        onedrive_source_bytes = _sum_values(onedrive_objects, "OneDriveSourceTotalSize") or 0
+        onedrive_target_bytes = _sum_values(onedrive_objects, "OneDriveTargetTotalSize") or 0
         onedrive_stats = {
             "Users": len(onedrive_objects),
             "Source Files": _sum_values(onedrive_objects, "OneDriveSourceFileCount") or 0,
             "Source Items": _sum_values(onedrive_objects, "OneDriveSourceItemCount") or 0,
             "Target Items": _sum_values(onedrive_objects, "OneDriveTargetItemCount") or 0,
-            "Source Size (bytes)": _sum_values(onedrive_objects, "OneDriveSourceTotalSize") or 0,
+            "Source Size (bytes)": onedrive_source_bytes,
+            "Migrated Data (bytes)": onedrive_target_bytes,
+            "Remaining Data (bytes)": max(0, onedrive_source_bytes - onedrive_target_bytes),
         }
+        if onedrive_source_bytes > 0:
+            onedrive_stats["Volume Completion (%)"] = round((onedrive_target_bytes / onedrive_source_bytes) * 100, 1)
         for label, count in onedrive_state_breakdown.items():
             onedrive_stats[label] = count
-        summaries.append(
-            _make_summary(
-                workload,
-                "OneDrive",
-                onedrive_objects,
-                onedrive_stats,
-                onedrive_state_breakdown,
-                [
-                    ("Last Run Status", _count_by(onedrive_objects, ("OneDriveStatus",))),
-                    ("Collect Statistics", _count_by(onedrive_objects, ("OneDriveAssessmentStatus",))),
-                ],
-                include_status_breakdown_in_stats=False,
-            )
+        onedrive_summary = _make_summary(
+            workload,
+            "OneDrive",
+            onedrive_objects,
+            onedrive_stats,
+            onedrive_state_breakdown,
+            [
+                ("Last Run Status", _count_by(onedrive_objects, ("OneDriveStatus",))),
+                ("Collect Statistics", _count_by(onedrive_objects, ("OneDriveAssessmentStatus",))),
+            ],
+            include_status_breakdown_in_stats=False,
         )
+        onedrive_summary["Details"]["Migrated Data Accuracy"] = "Direct from Quest oneDriveTargetTotalSize telemetry"
+        onedrive_summary["Details"]["Migrated Data Source"] = "Direct from Quest OneDrive target total size telemetry"
+        onedrive_summary["Details"]["Completion Metric"] = "Completed % = (Migrated + Migrated with Issues) / in-scope OneDrive users"
+        summaries.append(onedrive_summary)
 
     return summaries
 
 
 def _build_sharepoint_summary(workload: dict, objects: list):
+    site_objects = [
+        item for item in objects
+        if str(_first_value(item, ("spmType", "SpmType")) or "").strip().lower() == "site"
+    ]
+    headline_objects = site_objects if site_objects else objects
     status_breakdown = _to_quest_sharepoint_state_breakdown(
-        _count_by(objects, ("spmMigrationStatus", "spmMigratedState", "spmState", "MigrationStatus", "MigratedState", "State", "Status")),
+        _count_by(headline_objects, ("spmMigrationStatus", "spmMigratedState", "spmState", "MigrationStatus", "MigratedState", "State", "Status")),
         include_missing=True,
     )
     stats = {
-        "Objects": len(objects),
+        "Sites": len(headline_objects),
+        "Migratable Sites": sum(1 for item in headline_objects if _first_value(item, ("Migratable", "migratable")) is True),
+        "SharePoint Objects": len(objects),
         "Migratable Objects": sum(1 for item in objects if _first_value(item, ("Migratable", "migratable")) is True),
-        "Source Children": _sum_values(objects, "SourceChildrenCount", "spmSourceChildrenCount") or 0,
-        "Target Children": _sum_values(objects, "TargetChildrenCount", "spmTargetChildrenCount") or 0,
-        "Rollup Count": _sum_values(objects, "RollupCount", "spmRollupCount") or 0,
+        "Source Children": _sum_values(objects, ("SourceChildrenCount", "spmSourceChildrenCount")) or 0,
+        "Target Children": _sum_values(objects, ("TargetChildrenCount", "spmTargetChildrenCount")) or 0,
+        "Rollup Count": _sum_values(objects, ("RollupCount", "spmRollupCount")) or 0,
     }
-    return _make_summary(
+    summary = _make_summary(
         workload,
         "SharePoint",
-        objects,
+        headline_objects,
         stats,
         status_breakdown,
         [
@@ -17073,6 +18058,8 @@ def _build_sharepoint_summary(workload: dict, objects: list):
             ("Site Type", _count_by(objects, ("spmSiteType", "SiteType"))),
         ],
     )
+    summary["Details"]["SharePoint Objects Queried"] = len(objects)
+    return summary
 
 
 def _build_teams_summary(workload: dict, display_type: str, objects: list):
@@ -17838,7 +18825,7 @@ function Get-DetailCountLabel {
         'M365 Groups' { return 'Groups Queried' }
         'Distribution Groups' { return 'Distribution Groups Queried' }
         'Chats' { return 'Users Queried' }
-        'SharePoint' { return 'SharePoint Objects Queried' }
+        'SharePoint' { return 'SharePoint Sites Queried' }
         'Accounts' { return 'Accounts Queried' }
         default { return 'Objects Queried' }
     }
@@ -19325,6 +20312,15 @@ function Get-SharePointAggregate {
             objectStatus = @{ terms = @{ field = 'status._raw'; size = 25 } }
             objectType = @{ terms = @{ field = 'spmType._raw'; size = 10 } }
             siteType = @{ terms = @{ field = 'spmSiteType._raw'; size = 10 } }
+            siteObjects = @{
+                filter = @{ term = @{ 'spmType._raw' = 'Site' } }
+                aggs = @{
+                    migrationStatus = @{ terms = @{ field = 'spmMigrationStatus._raw'; size = 25 } }
+                    migratedState = @{ terms = @{ field = 'spmMigratedState._raw'; size = 25 } }
+                    objectStatus = @{ terms = @{ field = 'status._raw'; size = 25 } }
+                    migratable = @{ filter = @{ term = @{ migratable = $true } } }
+                }
+            }
             migratable = @{ filter = @{ term = @{ migratable = $true } } }
             sourceStorageUsageMb = @{ sum = @{ field = 'spmStorageUsage' } }
             sourceChildren = @{ sum = @{ field = 'spmSourceChildrenCount' } }
@@ -19340,23 +20336,50 @@ function Get-SharePointAggregate {
     }
 
     $statusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Convert-BucketsToOrderedMap $aggregate.migrationStatus.buckets) -IncludeMissing
-    if ($statusBreakdown.Count -eq 0) {
+    if ((Sum-Breakdown -Breakdown $statusBreakdown) -eq 0) {
         $statusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Convert-BucketsToOrderedMap $aggregate.migratedState.buckets) -IncludeMissing
     }
-    if ($statusBreakdown.Count -eq 0) {
+    if ((Sum-Breakdown -Breakdown $statusBreakdown) -eq 0) {
         $statusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Convert-BucketsToOrderedMap $aggregate.objectStatus.buckets) -IncludeMissing
+    }
+    $objectTypeBreakdown = Convert-BucketsToOrderedMap $aggregate.objectType.buckets
+    $siteTypeBreakdown = Convert-BucketsToOrderedMap $aggregate.siteType.buckets
+    $siteObjects = 0
+    $migratableSites = 0
+    $siteStatusBreakdown = [ordered]@{}
+    if ($null -ne $aggregate.siteObjects) {
+        $siteObjects = [int]$aggregate.siteObjects.doc_count
+        if ($null -ne $aggregate.siteObjects.migratable) {
+            $migratableSites = [int]$aggregate.siteObjects.migratable.doc_count
+        }
+        $siteStatusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Convert-BucketsToOrderedMap $aggregate.siteObjects.migrationStatus.buckets) -IncludeMissing
+        if ((Sum-Breakdown -Breakdown $siteStatusBreakdown) -eq 0) {
+            $siteStatusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Convert-BucketsToOrderedMap $aggregate.siteObjects.migratedState.buckets) -IncludeMissing
+        }
+        if ((Sum-Breakdown -Breakdown $siteStatusBreakdown) -eq 0) {
+            $siteStatusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Convert-BucketsToOrderedMap $aggregate.siteObjects.objectStatus.buckets) -IncludeMissing
+        }
+    }
+    if ($siteObjects -le 0 -and $objectTypeBreakdown.Contains('Site')) {
+        $siteObjects = [int]$objectTypeBreakdown['Site']
+    }
+    if ((Sum-Breakdown -Breakdown $siteStatusBreakdown) -eq 0) {
+        $siteStatusBreakdown = $statusBreakdown
     }
 
     return [pscustomobject]@{
         Objects = Get-TotalHitsValue -Response $response
+        Sites = $siteObjects
         MigratableObjects = $(if ($null -ne $aggregate.migratable) { [int]$aggregate.migratable.doc_count } else { 0 })
+        MigratableSites = $migratableSites
         SourceSizeBytes = Convert-MegabytesToBytes (Get-AggregationValue -Aggregate $aggregate -Name 'sourceStorageUsageMb')
         SourceChildren = Get-AggregationValue -Aggregate $aggregate -Name 'sourceChildren'
         TargetChildren = Get-AggregationValue -Aggregate $aggregate -Name 'targetChildren'
         RollupCount = Get-AggregationValue -Aggregate $aggregate -Name 'rollupCount'
         StatusBreakdown = $statusBreakdown
-        ObjectTypeBreakdown = Convert-BucketsToOrderedMap $aggregate.objectType.buckets
-        SiteTypeBreakdown = Convert-BucketsToOrderedMap $aggregate.siteType.buckets
+        SiteStatusBreakdown = $siteStatusBreakdown
+        ObjectTypeBreakdown = $objectTypeBreakdown
+        SiteTypeBreakdown = $siteTypeBreakdown
         ScopeCollections = @($validScopeCollections)
         StandaloneOnly = [bool]$StandaloneOnly
     }
@@ -20188,7 +21211,9 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                     }
                     $sharePointAggregate = Get-SharePointAggregate -Workload $workload -ScopeCollections $scopeCollections -StandaloneOnly:$($stream -eq 'sharepoint')
                     $stats = [ordered]@{
-                        'Objects' = $sharePointAggregate.Objects
+                        'Sites' = $sharePointAggregate.Sites
+                        'Migratable Sites' = $sharePointAggregate.MigratableSites
+                        'SharePoint Objects' = $sharePointAggregate.Objects
                         'Migratable Objects' = $sharePointAggregate.MigratableObjects
                         'Source Children' = $sharePointAggregate.SourceChildren
                         'Target Children' = $sharePointAggregate.TargetChildren
@@ -20197,14 +21222,15 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                     if ($null -ne $sharePointAggregate.SourceSizeBytes) {
                         $stats['Source Size (bytes)'] = $sharePointAggregate.SourceSizeBytes
                     }
-                    foreach ($stateEntry in $sharePointAggregate.StatusBreakdown.GetEnumerator()) {
+                    foreach ($stateEntry in $sharePointAggregate.SiteStatusBreakdown.GetEnumerator()) {
                         $stats[$stateEntry.Key] = $stateEntry.Value
                     }
-                    $sharePointSummary = New-Summary -Workload $workload -DisplayType 'SharePoint' -Objects @() -ObjectCount $sharePointAggregate.Objects -Stats $stats -StatusBreakdown $sharePointAggregate.StatusBreakdown -ExtraBreakdowns @(
+                    $sharePointSummary = New-Summary -Workload $workload -DisplayType 'SharePoint' -Objects @() -ObjectCount $sharePointAggregate.Sites -Stats $stats -StatusBreakdown $sharePointAggregate.SiteStatusBreakdown -ExtraBreakdowns @(
                         (New-BreakdownPair -Prefix 'Object Type' -Breakdown $sharePointAggregate.ObjectTypeBreakdown)
                         (New-BreakdownPair -Prefix 'Site Type' -Breakdown $sharePointAggregate.SiteTypeBreakdown)
                     ) -IncludeStatusBreakdownInStats $false
                     $sharePointSummary = Add-SharePointScopeDetails -Summary $sharePointSummary -ScopeCollections $sharePointAggregate.ScopeCollections
+                    $sharePointSummary.Details['SharePoint Objects Queried'] = $sharePointAggregate.Objects
                     if ($stream -eq 'sharepoint') {
                         $sharePointSummary.Details['Quest Site Filter'] = 'Standalone SharePoint sites only'
                         $sharePointSummary.Details['Query Strategy'] = $(if ($sharePointAggregate.ScopeCollections.Count -gt 0) { 'Quest collection-scoped aggregate query' } else { 'Quest workload aggregate query' })
@@ -20232,8 +21258,16 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         -not (Test-MeaningfulValue $siteType) -or $siteType -eq 'SharePoint'
                     })
                 }
+                $siteObjects = @($objects | Where-Object {
+                    $objectType = Get-FirstValue -Item $_ -Names @('spmType', 'SpmType')
+                    $objectTypeText = if ($null -ne $objectType) { $objectType.ToString() } else { '' }
+                    $objectTypeText.Trim() -eq 'Site'
+                })
+                $headlineObjects = @(if ($siteObjects.Count -gt 0) { $siteObjects } else { $objects })
                 $stats = [ordered]@{
-                    'Objects' = $objects.Count
+                    'Sites' = $headlineObjects.Count
+                    'Migratable Sites' = @($headlineObjects | Where-Object { (Get-FirstValue -Item $_ -Names @('migratable', 'Migratable')) -eq $true }).Count
+                    'SharePoint Objects' = $objects.Count
                     'Migratable Objects' = @($objects | Where-Object { (Get-FirstValue -Item $_ -Names @('migratable', 'Migratable')) -eq $true }).Count
                     'Source Children' = $(Sum-Property -Items $objects -Names @('SourceChildrenCount'))
                     'Target Children' = $(Sum-Property -Items $objects -Names @('TargetChildrenCount'))
@@ -20243,12 +21277,13 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                 if ($null -ne $sharePointSourceSizeBytes) {
                     $stats['Source Size (bytes)'] = $sharePointSourceSizeBytes
                 }
-                $sharePointStatusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Count-By -Items $objects -Names @('spmMigrationStatus', 'spmMigratedState', 'spmState', 'MigrationStatus', 'MigratedState', 'State', 'Status')) -IncludeMissing
-                $sharePointSummary = New-Summary -Workload $workload -DisplayType 'SharePoint' -Objects $objects -Stats $stats -StatusBreakdown $sharePointStatusBreakdown -ExtraBreakdowns @(
+                $sharePointStatusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Count-By -Items $headlineObjects -Names @('spmMigrationStatus', 'spmMigratedState', 'spmState', 'MigrationStatus', 'MigratedState', 'State', 'Status')) -IncludeMissing
+                $sharePointSummary = New-Summary -Workload $workload -DisplayType 'SharePoint' -Objects $headlineObjects -Stats $stats -StatusBreakdown $sharePointStatusBreakdown -ExtraBreakdowns @(
                     (New-BreakdownPair -Prefix 'Object Type' -Breakdown (Count-By -Items $objects -Names @('spmType', 'SpmType')))
                     (New-BreakdownPair -Prefix 'Site Type' -Breakdown (Count-By -Items $objects -Names @('spmSiteType', 'SiteType')))
                 )
                 $sharePointSummary = Add-SharePointScopeDetails -Summary $sharePointSummary -ScopeCollections $scopeCollections
+                $sharePointSummary.Details['SharePoint Objects Queried'] = $objects.Count
                 if ($stream -eq 'sharepoint') {
                     $sharePointSummary.Details['Quest Site Filter'] = 'Standalone SharePoint sites only'
                     $sharePointSummary.Details['Query Strategy'] = $(if ($scopeCollections.Count -gt 0) { 'Quest scoped collection enumeration' } else { 'Quest workload compact object query' })
@@ -20651,18 +21686,29 @@ def _dedupe_workload_summaries(items):
 def _cached_workload_data(org_id: str, project_id: str, stream: str):
     stream = _normalise_stream(stream)
     if stream == "all":
+        full_state = _get_progress_snapshot(_progress_key(org_id, project_id, "all"))
+        full_state_rows = full_state.get("data") if isinstance(full_state.get("data"), list) else []
+        full_state_rows = _dedupe_workload_summaries(full_state_rows or [])
         combined = []
         for child_stream in ("exchange", "onedrive", "collaboration", "distribution", "sharepoint"):
             child_state = _get_progress_snapshot(_progress_key(org_id, project_id, child_stream))
             if isinstance(child_state.get("data"), list) and child_state.get("data"):
                 combined.extend(child_state.get("data", []))
         combined = _dedupe_workload_summaries(combined)
+        if full_state_rows and len(full_state_rows) >= len(combined):
+            return sorted(
+                _decorate_workload_payload(org_id, project_id, stream, full_state_rows, response_source="cache"),
+                key=lambda item: (WORKLOAD_SORT_ORDER.get(item.get("DisplayType"), 99), item.get("DisplayType", ""), item.get("Name", "")),
+            )
         if combined:
-            return sorted(combined, key=lambda item: (WORKLOAD_SORT_ORDER.get(item.get("DisplayType"), 99), item.get("DisplayType", ""), item.get("Name", "")))
+            return sorted(
+                _decorate_workload_payload(org_id, project_id, stream, combined, response_source="cache"),
+                key=lambda item: (WORKLOAD_SORT_ORDER.get(item.get("DisplayType"), 99), item.get("DisplayType", ""), item.get("Name", "")),
+            )
         return None
     state = _get_progress_snapshot(_progress_key(org_id, project_id, stream))
     if isinstance(state.get("data"), list) and state.get("data"):
-        return state.get("data", [])
+        return _decorate_workload_payload(org_id, project_id, stream, state.get("data", []), response_source="cache")
     return None
 
 
@@ -20670,10 +21716,16 @@ def _progress_snapshot_with_cached_fallback(org_id: str, project_id: str, stream
     safe_snapshot = dict(snapshot or {})
     cached = _cached_workload_data(org_id, project_id, stream)
     if not (isinstance(cached, list) and cached):
+        if isinstance(safe_snapshot.get("data"), list) and safe_snapshot.get("data"):
+            safe_snapshot["data"] = _decorate_workload_payload(org_id, project_id, stream, safe_snapshot.get("data", []), response_source="cache")
         return safe_snapshot
     has_snapshot_data = isinstance(safe_snapshot.get("data"), list) and bool(safe_snapshot.get("data"))
     if not has_snapshot_data:
         safe_snapshot["data"] = _json_safe(copy.deepcopy(cached))
+    else:
+        safe_snapshot["data"] = _json_safe(
+            _decorate_workload_payload(org_id, project_id, stream, safe_snapshot.get("data", []), response_source="cache")
+        )
     status = str(safe_snapshot.get("status") or "").strip().lower()
     if status in {"error", "idle"} and not _worker_is_alive(_progress_key(org_id, project_id, stream)):
         safe_snapshot["status"] = "done"
@@ -23752,11 +24804,22 @@ def get_auth_status(org_id: str = ""):
     with auth_state_lock:
         session_state = dict(auth_session_state)
     if session_state.get("connected"):
+        cached_validation = _cached_auth_validation_result(org_id)
+        if cached_validation and not bool(cached_validation.get("ok")):
+            return {
+                "authenticated": False,
+                "orgId": org_id,
+                "region": session_state.get("region") or "",
+                "message": cached_validation.get("message") or session_state.get("message") or "",
+            }
+        current_region = str(session_state.get("region") or "").strip().upper()
+        if current_region:
+            _save_auth_session_hint(region=current_region, org_id=org_id)
         return {
             "authenticated": True,
             "orgId": org_id,
-            "region": session_state.get("region") or "",
-            "message": session_state.get("message") or "",
+            "region": current_region,
+            "message": session_state.get("message") or "Quest sign-in is active.",
         }
     return {
         "authenticated": False,
@@ -23777,23 +24840,56 @@ def reset_auth(region: str = ""):
 def get_projects(org_id: str, force: bool = False):
     if SELFTEST_MODE:
         return [{"Id": SELFTEST_PROJECT_ID, "ProjectId": SELFTEST_PROJECT_ID, "Name": SELFTEST_PROJECT_NAME}]
-    _require_quest_session(org_id)
+    cached_projects = []
+    stale_projects = []
+    fallback_projects = []
     try:
         if not force:
+            cached_projects = _get_cached_project_catalog(
+                org_id,
+                require_live=_quest_session_is_connected(),
+            )
+            if cached_projects:
+                return cached_projects
             active_meta = _active_execution_snapshot()
             active_priority = str(active_meta.get("priority") or "").strip().lower()
             if active_meta and active_priority == "background":
-                cached_projects = _get_cached_project_catalog(org_id)
-                if cached_projects:
-                    return cached_projects
+                stale_projects = _get_cached_project_catalog(org_id, max_age_seconds=-1, allow_stale=True)
+                if stale_projects:
+                    return stale_projects
+                fallback_projects = _saved_project_catalog_fallback(org_id)
+                if fallback_projects:
+                    _append_auth_runtime_log(f"Using derived project catalog for org {org_id} while background work is active.")
+                    return fallback_projects
+        _require_quest_session(org_id)
         cmd = _ps_select_org_prelude(org_id) + "Get-OdmProject"
         payload = ps_session.execute(cmd, as_json=True, priority="critical", command_label=f"Project list for {org_id}")
         with auth_state_lock:
             current_region = str(auth_session_state.get("region") or "").strip().upper()
         if current_region:
             _save_auth_session_hint(region=current_region, org_id=org_id)
-        return _cache_project_catalog(org_id, payload)
+        return _cache_project_catalog(org_id, payload, source="live")
+    except HTTPException as exc:
+        if not force and exc.status_code == 401:
+            stale_projects = _get_cached_project_catalog(org_id, max_age_seconds=-1, allow_stale=True)
+            if stale_projects:
+                _append_auth_runtime_log(f"Falling back to cached project catalog for org {org_id}: {_friendly_quest_error(exc.detail or exc)}")
+                return stale_projects
+            fallback_projects = _saved_project_catalog_fallback(org_id)
+            if fallback_projects:
+                _append_auth_runtime_log(f"Falling back to derived project catalog for org {org_id}: {_friendly_quest_error(exc.detail or exc)}")
+                return fallback_projects
+        raise
     except Exception as e:
+        if not force:
+            stale_projects = _get_cached_project_catalog(org_id, max_age_seconds=-1, allow_stale=True)
+            if stale_projects:
+                _append_auth_runtime_log(f"Falling back to cached project catalog for org {org_id}: {_friendly_quest_error(e)}")
+                return stale_projects
+            fallback_projects = _saved_project_catalog_fallback(org_id)
+            if fallback_projects:
+                _append_auth_runtime_log(f"Falling back to derived project catalog for org {org_id}: {_friendly_quest_error(e)}")
+                return fallback_projects
         friendly_error = _friendly_quest_error(e)
         if _quest_error_requires_reauth(friendly_error):
             _set_auth_session_state(False, friendly_error)
@@ -24530,12 +25626,25 @@ def get_update_progress():
 def health():
     process = getattr(ps_session, "process", None)
     ps_alive = bool(process and process.poll() is None)
-    with progress_lock:
-        active_workers = sum(1 for worker in workload_threads.values() if worker and worker.is_alive())
+    active_workers = None
+    progress_busy = False
+    acquired = False
+    try:
+        acquired = progress_lock.acquire(timeout=0.2)
+    except TypeError:
+        acquired = progress_lock.acquire()
+    if acquired:
+        try:
+            active_workers = sum(1 for worker in workload_threads.values() if worker and worker.is_alive())
+        finally:
+            progress_lock.release()
+    else:
+        progress_busy = True
     return {
         "status": "ok",
         "powerShellAlive": ps_alive,
         "activeWorkers": active_workers,
+        "progressBusy": progress_busy,
         "appVersion": APP_VERSION,
         "appUrl": APP_URL,
         "selftest": SELFTEST_MODE,
@@ -24630,4 +25739,3 @@ if __name__ == '__main__':
         _run_in_embedded_window(APP_URL)
     else:
         _run_in_browser(APP_URL)
-
