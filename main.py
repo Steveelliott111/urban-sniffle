@@ -5301,6 +5301,8 @@ HTML_CONTENT = """
         let currentSearchPayload = null;
         let currentUpdatePayload = null;
         let updateProgressTimer = null;
+        let updateAutoCheckStarted = false;
+        let updateAutoPromptedVersion = '';
         let connectionStatusTimer = null;
         let projectWarmupState = null;
         let projectWarmupToken = 0;
@@ -5999,24 +6001,70 @@ HTML_CONTENT = """
                 }
                 renderUpdateSummary(payload);
                 if (payload.updateAvailable) {
-                    const notesLine = payload.notes ? `\n\nRelease notes:\n${payload.notes.substring(0, 900)}` : '';
-                    logError(`Update available: ${payload.latestVersion}`);
-                    const proceed = confirm(`ODM Architect ${payload.latestVersion} is available.${notesLine}\n\nInstall this update now?`);
-                    if (proceed) {
-                        await applyAvailableUpdate();
-                    } else {
-                        renderUpdateSummary({
-                            ...payload,
-                            status: 'available',
-                            message: `ODM Architect ${payload.latestVersion} is ready to install whenever you are.`
-                        });
-                    }
+                    await promptForAvailableUpdate(payload);
                 } else {
                     logError(payload.message || `ODM Architect ${payload.currentVersion} is already current.`);
                 }
             } catch (err) {
                 renderUpdateSummary({ ...currentUpdatePayload, message: `Update check failed: ${err.message}` });
                 logError(`Update Error: ${err.message}`);
+            }
+        }
+
+        async function promptForAvailableUpdate(payload, options = {}) {
+            if (!payload?.updateAvailable) return false;
+            const latestVersion = String(payload.latestVersion || '').trim();
+            if (!latestVersion) return false;
+            if (options.automatic) {
+                if (updateAutoPromptedVersion === latestVersion) return false;
+                updateAutoPromptedVersion = latestVersion;
+            }
+            const notesLine = payload.notes ? `\n\nRelease notes:\n${payload.notes.substring(0, 900)}` : '';
+            logError(`${options.automatic ? 'Automatic update check found' : 'Update available'}: ${latestVersion}`);
+            const proceed = confirm(`ODM Architect ${latestVersion} is available.${notesLine}\n\nInstall this update now?`);
+            if (proceed) {
+                await applyAvailableUpdate();
+                return true;
+            }
+            renderUpdateSummary({
+                ...payload,
+                status: 'available',
+                message: `ODM Architect ${latestVersion} is ready to install whenever you are.`
+            });
+            return false;
+        }
+
+        async function autoCheckForUpdates() {
+            if (updateAutoCheckStarted) return;
+            updateAutoCheckStarted = true;
+            const previousPayload = currentUpdatePayload || {};
+            try {
+                const status = String(previousPayload.status || '').trim().toLowerCase();
+                if (status === 'checking' || status === 'running' || status === 'scheduled_restart') return;
+                renderUpdateSummary({
+                    ...previousPayload,
+                    currentVersion: previousPayload.currentVersion || 'Unknown',
+                    supported: previousPayload.supported !== false,
+                    status: 'checking',
+                    message: 'Checking GitHub for the latest ODM Architect release...',
+                    progress: 10
+                });
+                const res = await fetch('/api/update/check', { method: 'POST' });
+                const payload = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    throw new Error(payload.detail || payload.message || `HTTP ${res.status}`);
+                }
+                renderUpdateSummary(payload);
+                if (payload.updateAvailable) {
+                    await promptForAvailableUpdate(payload, { automatic: true });
+                }
+            } catch (err) {
+                renderUpdateSummary({
+                    ...previousPayload,
+                    status: previousPayload.status || 'idle',
+                    message: `Automatic update check failed: ${err.message}`
+                });
+                logError(`Update Check Warning: ${err.message}`);
             }
         }
 
@@ -6134,6 +6182,9 @@ HTML_CONTENT = """
             await setSidebarSectionsState(getGuidedSidebarState('auth'), false);
             renderSavedOrgOptions();
             await loadUpdateStatus();
+            setTimeout(() => {
+                autoCheckForUpdates().catch(err => logError(`Update Check Warning: ${err.message}`));
+            }, 1500);
             startConnectionStatusPolling();
             populateReportAudienceOptions();
             document.getElementById('nav-execView')?.classList.add('active');
@@ -7380,6 +7431,10 @@ HTML_CONTENT = """
                 'forecast confidence': 'A confidence score for the ETA and trend based on history depth, freshness, and data quality.',
                 'cutover readiness': 'A readiness judgement based on completion, pending backlog, active queue, and hard-failure gates.',
                 'data migrated': 'The amount of data the dashboard can currently attribute to this workload from Quest telemetry.',
+                'source still to complete': 'For Teams, this is source content on Teams that are not yet in a completed Quest migration state.',
+                'source left': 'For Teams, this is source content on Teams that are not yet in a completed Quest migration state.',
+                'target content present': 'For Teams, this is the target content footprint Quest reports after migration activity. It is tracked separately from source completion.',
+                'scoped source content': 'The source content footprint Quest reports for this scoped workload.',
                 'avg throughput': 'Average migrated data volume per hour, based on Quest timing and migrated data signals.',
                 'task runtime': 'The runtime window the dashboard could derive from Quest task telemetry.',
                 'telemetry': 'Whether the migrated data and throughput are direct Quest values or estimates.',
@@ -7943,8 +7998,58 @@ HTML_CONTENT = """
             };
         }
 
+        function isTeamsWorkload(item) {
+            return String(getDisplayType(item) || '').toLowerCase() === 'teams';
+        }
+
+        function getTeamsVolumePosition(item) {
+            const overview = getOverview(item);
+            const sourceBytes = parseNumber(overview.sourceBytes)
+                ?? parseNumber(getFirstMetricValue(item, ['Source Size (bytes)']));
+            const targetBytes = parseNumber(overview.migratedBytes)
+                ?? parseNumber(getFirstMetricValue(item, ['Migrated Data (bytes)', 'Migrated Bytes']));
+            const remainingSourceBytes = parseNumber(overview.remainingSourceBytes)
+                ?? parseNumber(getFirstMetricValue(item, ['Remaining Source Size (bytes)']));
+            const completedSourceBytes = parseNumber(overview.completedSourceBytes)
+                ?? parseNumber(getFirstMetricValue(item, ['Completed Source Size (bytes)']));
+            const targetExceedsSource = sourceBytes !== null && targetBytes !== null && targetBytes > sourceBytes;
+            return {
+                sourceBytes,
+                targetBytes,
+                remainingSourceBytes,
+                completedSourceBytes,
+                targetExceedsSource,
+                sourceLabel: formatBytes(sourceBytes),
+                targetLabel: formatBytes(targetBytes),
+                remainingSourceLabel: formatBytes(remainingSourceBytes),
+                completedSourceLabel: formatBytes(completedSourceBytes),
+                remainingNote: 'Quest source content on Teams that are not yet in a completed migration state',
+                targetNote: targetExceedsSource
+                    ? 'Target content footprint from Quest. It can be larger than source, so it is not used to calculate what is left.'
+                    : 'Target content footprint reported by Quest after migration activity.',
+                sourceNote: 'Quest source content footprint for the scoped Teams workload.',
+            };
+        }
+
         function getPrimaryMetricTile(item) {
             const lowerType = String(getDisplayType(item) || '').toLowerCase();
+            if (lowerType === 'teams') {
+                const teamsVolume = getTeamsVolumePosition(item);
+                if (teamsVolume.remainingSourceBytes !== null) {
+                    return {
+                        label: 'Source Still To Complete',
+                        value: teamsVolume.remainingSourceLabel,
+                        note: teamsVolume.remainingNote,
+                    };
+                }
+                if (teamsVolume.targetBytes !== null) {
+                    return {
+                        label: 'Target Content Present',
+                        value: teamsVolume.targetLabel,
+                        note: teamsVolume.targetNote,
+                    };
+                }
+            }
             const migratedTelemetry = getMigratedDataTelemetry(item);
             if (migratedTelemetry.bytes !== null && migratedTelemetry.bytes > 0) {
                 return {
@@ -8025,6 +8130,21 @@ HTML_CONTENT = """
             const forecastNote = activeObjects > 0
                 ? 'Active workload telemetry is live, but ETA remains guarded'
                 : 'No reliable ETA is being published from the current telemetry';
+            if (String(getDisplayType(item) || '').toLowerCase() === 'teams') {
+                const teamsVolume = getTeamsVolumePosition(item);
+                return [
+                    [entityLabels.scoped, formatStatValue(totalObjects), 'Project-scoped Teams population'],
+                    ['Teams Complete', formatStatValue(completedObjects), `${formatPercentNumber(completionPercent)} complete by Quest Team state`],
+                    ['Source Still To Complete', teamsVolume.remainingSourceLabel, teamsVolume.remainingNote],
+                    ['Needs Attention', formatStatValue(issueObjects), `${formatRatioPercent(issueObjects, totalObjects, 2)} of Teams scope flagged`],
+                    ['Target Content Present', teamsVolume.targetLabel, teamsVolume.targetNote],
+                    ['Scoped Source Content', teamsVolume.sourceLabel, teamsVolume.sourceNote],
+                    ['In Flight', inFlight.activeLabel, inFlight.note],
+                    ['Data Trust', freshness.lastLiveRefreshLabel || formatAgeLabel(freshness.ageSeconds), freshness.stale ? 'Refresh recommended before using this for governance' : (freshness.warning ? 'Telemetry is aging' : 'Fresh Quest telemetry in this session')],
+                    ['Forecast Confidence', confidence.label || 'Limited', confidence.note || 'Confidence will improve as more history accumulates'],
+                    ['Cutover Readiness', readiness.label || 'Unknown', readiness.blockers?.[0] || 'No readiness blockers are being surfaced yet'],
+                ];
+            }
             const tiles = [
                 [entityLabels.scoped, formatStatValue(totalObjects), `Project-scoped ${entityLabels.plural} population`],
                 ['Completed', formatStatValue(completedObjects), (overview.completionBasis === 'volume')
@@ -8082,6 +8202,27 @@ HTML_CONTENT = """
         }
 
         function buildGenericKpiCards(item) {
+            const lowerType = String(getDisplayType(item) || '').toLowerCase();
+            if (lowerType === 'teams') {
+                const teamsVolume = getTeamsVolumePosition(item);
+                const cards = [];
+                if (teamsVolume.remainingSourceBytes !== null) {
+                    cards.push(['Source Still To Complete', teamsVolume.remainingSourceLabel, teamsVolume.remainingNote]);
+                }
+                if (teamsVolume.targetBytes !== null) {
+                    cards.push(['Target Content Present', teamsVolume.targetLabel, teamsVolume.targetNote]);
+                }
+                if (teamsVolume.sourceBytes !== null) {
+                    cards.push(['Scoped Source Content', teamsVolume.sourceLabel, teamsVolume.sourceNote]);
+                }
+                ['Members', 'Messages', 'Migrated Messages', 'Planner Plans', 'Migrated Plans', 'Planner Tasks', 'Migrated Tasks', 'Scope Collections'].forEach(label => {
+                    const value = getFirstMetricValue(item, [label]);
+                    if (value !== null && value !== undefined && value !== '') {
+                        cards.push([label, formatMetricValueByLabel(label, value), getKpiMetricNote(label)]);
+                    }
+                });
+                return cards;
+            }
             const preferredLabels = getPreferredKpiDefinitions(item);
             const cards = [];
             const usedLabels = new Set();
@@ -8100,6 +8241,7 @@ HTML_CONTENT = """
         }
 
         function buildGenericBarometerMetrics(item) {
+            const lowerType = String(getDisplayType(item) || '').toLowerCase();
             const overview = getOverview(item);
             const entityLabels = getWorkloadEntityLabels(item);
             const totalObjects = parseNumber(overview.totalObjects) || 0;
@@ -8132,6 +8274,35 @@ HTML_CONTENT = """
                     caption: `${formatStatValue(issueObjects)} ${entityLabels.plural} are in warning or failed states`,
                 },
             ];
+
+            if (lowerType === 'teams') {
+                const teamsVolume = getTeamsVolumePosition(item);
+                if (teamsVolume.remainingSourceBytes !== null) {
+                    const backlogPercent = teamsVolume.sourceBytes && teamsVolume.sourceBytes > 0
+                        ? Math.min(100, (teamsVolume.remainingSourceBytes / teamsVolume.sourceBytes) * 100)
+                        : 0;
+                    metrics.push({
+                        label: 'Source Left',
+                        valueLabel: teamsVolume.remainingSourceLabel,
+                        percent: backlogPercent,
+                        toneClass: teamsVolume.remainingSourceBytes > 0 ? 'tone-warning' : 'tone-success',
+                        caption: teamsVolume.remainingNote,
+                    });
+                }
+                if (teamsVolume.targetBytes !== null) {
+                    const targetPercent = teamsVolume.sourceBytes && teamsVolume.sourceBytes > 0
+                        ? Math.min(100, (teamsVolume.targetBytes / teamsVolume.sourceBytes) * 100)
+                        : 100;
+                    metrics.push({
+                        label: 'Target Content Present',
+                        valueLabel: teamsVolume.targetLabel,
+                        percent: targetPercent,
+                        toneClass: 'tone-accent',
+                        caption: teamsVolume.targetNote,
+                    });
+                }
+                return metrics;
+            }
 
             if (activeObjects > 0) {
                 metrics.push({
@@ -8260,6 +8431,9 @@ HTML_CONTENT = """
             const issueObjects = parseNumber(overview.issueObjects) || 0;
             const subjectLabel = getWorkloadAudienceLabel(item);
             const summaryLead = `${getDisplayStatus(item)} across ${formatStatValue(totalObjects)} scoped ${entityLabels.plural}, with ${formatStatValue(issueObjects)} needing attention${topSegment ? ` and ${formatStatValue(topSegment.value)} currently in '${topSegment.label}'.` : '.'}`;
+            const summaryPosture = isTeamsWorkload(item)
+                ? `${summaryLead} Target content is shown separately from source completion because Quest target footprint can exceed source footprint for Teams.`
+                : summaryLead;
             const snapshotTiles = buildGenericSnapshotTiles(item);
             const kpiCards = buildGenericKpiCards(item);
             const detailRows = renderDetailRows(details, 'Details');
@@ -8314,7 +8488,7 @@ HTML_CONTENT = """
                         <div class="exchange-hero-copy">
                             <div class="exchange-hero-eyebrow">${escapeHtml(getDisplayType(item))} Briefing</div>
                             <h3 class="exchange-hero-title">${escapeHtml(getDisplayType(item))} migration posture at a glance</h3>
-                            <p class="exchange-hero-summary">${escapeHtml(summaryLead)}</p>
+                            <p class="exchange-hero-summary">${escapeHtml(summaryPosture)}</p>
                             <div class="exchange-status-chip-row">
                                 ${signalCards.map(([label, value, note]) => `
                                     <div class="exchange-status-chip">
@@ -8712,6 +8886,7 @@ HTML_CONTENT = """
 
         function renderCard(item, index) {
             const typeName = getDisplayType(item);
+            const lowerType = String(typeName || '').toLowerCase();
             const statusName = getDisplayStatus(item);
             const overview = getOverview(item);
             const entityLabels = getWorkloadEntityLabels(item);
@@ -8732,6 +8907,20 @@ HTML_CONTENT = """
                 : (migratedBytesValue !== null && migratedBytesValue > 0
                     ? migratedTelemetry.note
                     : 'Quest did not return migrated-volume telemetry for this workload');
+            const teamsVolume = lowerType === 'teams' ? getTeamsVolumePosition(item) : null;
+            const primaryDataMetric = teamsVolume
+                ? {
+                    label: 'Source still to complete',
+                    value: teamsVolume.remainingSourceBytes !== null ? teamsVolume.remainingSourceLabel : teamsVolume.targetLabel,
+                    note: teamsVolume.remainingSourceBytes !== null
+                        ? `${teamsVolume.remainingNote}. Target content present: ${teamsVolume.targetLabel}.`
+                        : teamsVolume.targetNote,
+                }
+                : {
+                    label: 'Data migrated',
+                    value: migratedBytesLabel,
+                    note: migratedVolumeNote,
+                };
             const throughputLabel = formatBytesPerHour(overview.throughputBytesPerHour);
             const throughputHint = overview.taskState
                 ? `${escapeHtml(overview.taskState)} across ${formatStatValue(overview.taskHours || 0)} hrs`
@@ -8771,9 +8960,9 @@ HTML_CONTENT = """
                     </div>
                     <div class="card-metric-grid">
                         <div class="card-metric-card">
-                            ${renderInfoLabel('Data migrated', item, `${migratedVolumeNote}.`)}
-                            <strong>${escapeHtml(migratedBytesLabel)}</strong>
-                            <small>${escapeHtml(migratedVolumeNote)}</small>
+                            ${renderInfoLabel(primaryDataMetric.label, item, `${primaryDataMetric.note}.`)}
+                            <strong>${escapeHtml(primaryDataMetric.value)}</strong>
+                            <small>${escapeHtml(primaryDataMetric.note)}</small>
                         </div>
                         <div class="card-metric-card">
                             ${renderInfoLabel('In Flight', item, inFlight.note)}
@@ -14094,44 +14283,9 @@ while ($true) {
         safe_region = str(region or "").strip().upper()
         if not safe_region or SELFTEST_MODE:
             return False
-        self._ensure_worker_paths()
-        if (
-            not self.requests_dir.exists()
-            or not self.responses_dir.exists()
-            or not self.status_path.exists()
-            or self.process is None
-            or self.process.poll() is not None
-            or not isinstance(self.process, subprocess.Popen)
-        ):
-            return False
-        ordered_org_ids = []
-        seen = set()
-        restore_command_builder = globals().get("_ps_silent_rehydrate_command")
-        if not callable(restore_command_builder):
-            return False
-        for org_id in candidate_org_ids or ():
-            safe_org_id = str(org_id or "").strip()
-            if not safe_org_id or safe_org_id in seen:
-                continue
-            seen.add(safe_org_id)
-            ordered_org_ids.append(safe_org_id)
-        commands = []
-        if ordered_org_ids:
-            for org_id in ordered_org_ids:
-                commands.append(restore_command_builder(safe_region, org_id))
-        else:
-            commands.append(restore_command_builder(safe_region, ""))
-        for command in commands:
-            try:
-                self._run_worker_request(
-                    command,
-                    as_json=False,
-                    command_label=f"Quest silent session restore {safe_region}",
-                )
-                return True
-            except Exception as exc:
-                _append_auth_runtime_log(f"Silent Quest session restore failed for region {safe_region}: {_friendly_quest_error(exc)}")
-                continue
+        _append_auth_runtime_log(
+            f"Silent Quest session restore skipped for region {safe_region}: automatic restore must not launch interactive authentication."
+        )
         return False
 
     def _restart_process(self, visible: bool | None = None, preserve_auth: bool | None = None):
@@ -14238,8 +14392,6 @@ while ($true) {
                 pass
 
     def execute(self, cmd: str, as_json: bool = True, progress_callback=None, progress_key: str | None = None, priority: str = "normal", command_label: str = ""):
-        if self._is_primary_auth_session() and str(priority or "normal").strip().lower() == "background" and "bg_session" in globals():
-            return bg_session.execute(cmd, as_json, progress_callback, progress_key, priority, command_label)
         self._ensure_worker_paths()
         wait_started = None
         last_wait_update = 0.0
@@ -14300,10 +14452,14 @@ while ($true) {
                 try:
                     if self.process is None or self.process.poll() is not None:
                         self._restart_process(visible=self.console_visible or auth_execution, preserve_auth=not auth_execution)
+                        if not auth_execution and self._is_primary_auth_session() and not _quest_session_is_connected():
+                            raise RuntimeError(_quest_session_error_message("Quest session was reset. Use 'Entra ID Login' to sign in again."))
                 except Exception as exc:
                     if attempt == 0:
                         last_error = exc
                         self._restart_process(visible=self.console_visible or auth_execution, preserve_auth=not auth_execution)
+                        if not auth_execution and self._is_primary_auth_session() and not _quest_session_is_connected():
+                            raise RuntimeError(_quest_session_error_message("Quest session was reset. Use 'Entra ID Login' to sign in again."))
                         continue
                     raise
 
@@ -14322,6 +14478,8 @@ while ($true) {
                     if attempt == 0 and _is_retryable_worker_exception(exc):
                         last_error = exc
                         self._restart_process(visible=self.console_visible or auth_execution, preserve_auth=not auth_execution)
+                        if not auth_execution and self._is_primary_auth_session() and not _quest_session_is_connected():
+                            raise RuntimeError(_quest_session_error_message("Quest session was reset. Use 'Entra ID Login' to sign in again."))
                         continue
                     raise
                 return result
@@ -16657,6 +16815,8 @@ def _build_workload_overview(summary: dict) -> dict:
     stats = summary.get("Statistics") or {}
     details = summary.get("Details") or {}
     migrated_bytes = _direct_migrated_bytes(summary)
+    if migrated_bytes is None and display_type in {"mailboxes", "archive mailboxes", "sharepoint"}:
+        migrated_bytes = _parse_number(stats.get("Migrated Data (bytes)"))
     throughput_bytes_per_hour = _parse_number(stats.get("Average Throughput (bytes/hour)"))
     task_hours = _parse_number(details.get("Task Runtime Hours"))
     status_completion_percent = round((completed / total_objects) * 100, 1) if total_objects else 0
@@ -16667,6 +16827,8 @@ def _build_workload_overview(summary: dict) -> dict:
         or _parse_number(stats.get("Source Data (bytes)"))
         or _parse_number(stats.get("Source Total Size (bytes)"))
     )
+    completed_source_bytes = _parse_number(stats.get("Completed Source Size (bytes)"))
+    remaining_source_bytes = _parse_number(stats.get("Remaining Source Size (bytes)"))
     remaining_bytes = None
     completion_percent = status_completion_percent
     completion_basis = "status"
@@ -16707,31 +16869,39 @@ def _build_workload_overview(summary: dict) -> dict:
         status_completion_label = completion_label
         completed_count_label = "Mailboxes completed" if display_type == "mailboxes" else "Archive mailboxes completed"
         donut_caption = "mailboxes complete" if display_type == "mailboxes" else "archive mailboxes complete"
-        completion_note = "Completion based on live Quest mailbox states. 'Migrated with Issues' remains finished for progress and flagged separately for quality."
+        completion_note = "Completion based on live Quest mailbox states. 'Migrated with Issues' remains finished for progress and flagged separately for quality. Data left uses source mailbox size still outside completed states when target size is unavailable."
+        if remaining_source_bytes is not None:
+            remaining_bytes = max(0.0, float(remaining_source_bytes))
     elif display_type == "teams":
         completion_label = "Team status completion"
         completed_count_label = "Teams completed"
         status_completion_label = completion_label
-        completion_note = "Completion based on live Quest Team migration states. Quest target content size telemetry is shown separately and is not used for completion because it does not align reliably with scoped Team status."
+        completion_note = "Completion based on live Quest Team migration states. Data left uses source content size still outside completed Team states because target content telemetry can exceed source size."
         donut_caption = "teams complete"
-        if source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+        if remaining_source_bytes is not None:
+            remaining_bytes = max(0.0, float(remaining_source_bytes))
+        elif source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
             remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
     elif display_type == "m365 groups":
         completion_label = "Group status completion"
         completed_count_label = "Groups completed"
         status_completion_label = completion_label
-        completion_note = "Completion based on live Quest M365 Group migration states. Quest target content size telemetry is shown separately and is not used for completion because it does not align reliably with scoped Group status."
+        completion_note = "Completion based on live Quest M365 Group migration states. Data left uses source content size still outside completed Group states because target content telemetry can exceed source size."
         donut_caption = "groups complete"
-        if source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+        if remaining_source_bytes is not None:
+            remaining_bytes = max(0.0, float(remaining_source_bytes))
+        elif source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
             remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
     elif display_type == "sharepoint":
         completion_label = "SharePoint site completion"
         status_completion_label = completion_label
         completed_count_label = "SharePoint sites completed"
-        completion_note = "Completion based on live Quest SharePoint site migration states. Partial and failed states remain outside the main completion numerator."
+        completion_note = "Completion based on live Quest standalone SharePoint site migration states. Partial and failed states remain outside the main completion numerator. Data left uses source storage still outside completed standalone SharePoint states."
         completed_count_note = f"{completed:,} completed sites across {total_objects:,} scoped SharePoint sites." if total_objects else "No scoped SharePoint sites returned by Quest."
         donut_caption = "sites complete"
-        if source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
+        if remaining_source_bytes is not None:
+            remaining_bytes = max(0.0, float(remaining_source_bytes))
+        elif source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
             remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
     elif source_bytes and source_bytes > 0 and migrated_bytes is not None and migrated_bytes >= 0:
         remaining_bytes = max(0.0, float(source_bytes) - float(migrated_bytes))
@@ -16754,6 +16924,8 @@ def _build_workload_overview(summary: dict) -> dict:
         "migratedBytes": migrated_bytes,
         "migratedBytesEstimated": str(details.get("Migrated Data Accuracy", "")).strip().lower().startswith("estimated"),
         "sourceBytes": source_bytes,
+        "completedSourceBytes": completed_source_bytes,
+        "remainingSourceBytes": remaining_source_bytes,
         "remainingBytes": remaining_bytes,
         "throughputBytesPerHour": throughput_bytes_per_hour,
         "taskHours": task_hours,
@@ -18035,7 +18207,7 @@ def _build_sharepoint_summary(workload: dict, objects: list):
     ]
     headline_objects = site_objects if site_objects else objects
     status_breakdown = _to_quest_sharepoint_state_breakdown(
-        _count_by(headline_objects, ("spmMigrationStatus", "spmMigratedState", "spmState", "MigrationStatus", "MigratedState", "State", "Status")),
+        _count_by(headline_objects, ("spmMigrationStatus", "SpmMigrationStatus", "spmMigratedState", "SpmMigratedState", "spmState", "SpmState", "MigrationStatus", "MigratedState", "State", "Status")),
         include_missing=True,
     )
     stats = {
@@ -18055,7 +18227,7 @@ def _build_sharepoint_summary(workload: dict, objects: list):
         status_breakdown,
         [
             ("Object Type", _count_by(objects, ("spmType", "SpmType"))),
-            ("Site Type", _count_by(objects, ("spmSiteType", "SiteType"))),
+            ("Site Type", _count_by(objects, ("spmSiteType", "SpmSiteType", "SiteType"))),
         ],
     )
     summary["Details"]["SharePoint Objects Queried"] = len(objects)
@@ -18448,7 +18620,7 @@ function Sum-Property {
         $value = Get-FirstValue -Item $item -Names $Names
         if ($null -eq $value) { continue }
         $parsed = [double]0
-        $text = $value.ToString().Replace(',', '')
+        $text = (Convert-QuestValueToText $value).Replace(',', '')
         if ([double]::TryParse($text, [ref]$parsed)) {
             $sum += $parsed
             $found = $true
@@ -18466,7 +18638,7 @@ function Count-By {
     foreach ($item in $Items) {
         $value = Get-FirstValue -Item $item -Names $Names
         if ($null -eq $value) { continue }
-        $label = $value.ToString().Trim()
+        $label = (Convert-QuestValueToText $value).Trim()
         if ([string]::IsNullOrWhiteSpace($label)) { continue }
         if ($counts.ContainsKey($label)) {
             $counts[$label] += 1
@@ -18850,6 +19022,143 @@ function Convert-BucketsToOrderedMap {
     return $ordered
 }
 
+function Convert-QuestValueToText {
+    param($Value)
+
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value.Trim() }
+
+    foreach ($name in @('_raw', 'raw', 'value', 'Value', 'name', 'Name', 'label', 'Label')) {
+        $property = $Value.PSObject.Properties[$name]
+        if ($null -ne $property -and (Test-MeaningfulValue $property.Value)) {
+            return "$($property.Value)".Trim()
+        }
+    }
+
+    return "$Value".Trim()
+}
+
+function Convert-SourceSizeBucketsToOrderedMap {
+    param(
+        $Buckets,
+        [string]$SumName = 'sourceSize',
+        [string]$StateFamily = 'raw',
+        [double]$Multiplier = 1
+    )
+
+    $ordered = [ordered]@{}
+    foreach ($bucket in @($Buckets)) {
+        if ($null -eq $bucket) { continue }
+        $key = $null
+        if (Test-MeaningfulValue $bucket.key_as_string) {
+            $key = $bucket.key_as_string
+        }
+        elseif (Test-MeaningfulValue $bucket.key) {
+            $key = $bucket.key
+        }
+        if (-not (Test-MeaningfulValue $key)) { continue }
+
+        $label = switch ($StateFamily) {
+            'mailbox' { Normalise-QuestMailboxStateLabel -Label "$key" }
+            'collaboration' { Normalise-QuestCollaborationStateLabel -Label "$key" }
+            'onedrive' { Normalise-QuestOneDriveStateLabel -Label "$key" }
+            'sharepoint' { Normalise-QuestSharePointStateLabel -Label "$key" }
+            default { "$key" }
+        }
+        if (-not (Test-MeaningfulValue $label)) { continue }
+
+        $sumProperty = $bucket.PSObject.Properties[$SumName]
+        if ($null -eq $sumProperty -or $null -eq $sumProperty.Value) { continue }
+        $rawValue = $sumProperty.Value
+        if ($rawValue.PSObject.Properties['value']) {
+            $rawValue = $rawValue.value
+        }
+
+        $parsed = [double]0
+        if (-not [double]::TryParse($rawValue.ToString(), [ref]$parsed)) { continue }
+        $bytes = [long][math]::Round(($parsed * $Multiplier), 0)
+        $current = 0
+        if ($ordered.Contains($label)) {
+            $current = [long]$ordered[$label]
+        }
+        $ordered[$label] = [long]($current + $bytes)
+    }
+    return $ordered
+}
+
+function Get-ObjectSourceSizeByStatus {
+    param(
+        [object[]]$Items,
+        [string[]]$StateNames,
+        [string[]]$SizeNames,
+        [string]$StateFamily = 'raw',
+        [double]$Multiplier = 1
+    )
+
+    $ordered = [ordered]@{}
+    foreach ($item in @($Items)) {
+        $stateValue = Get-FirstValue -Item $item -Names $StateNames
+        $label = Convert-QuestValueToText $stateValue
+        $label = switch ($StateFamily) {
+            'mailbox' { Normalise-QuestMailboxStateLabel -Label $label }
+            'collaboration' { Normalise-QuestCollaborationStateLabel -Label $label }
+            'onedrive' { Normalise-QuestOneDriveStateLabel -Label $label }
+            'sharepoint' { Normalise-QuestSharePointStateLabel -Label $label }
+            default { $label }
+        }
+        if (-not (Test-MeaningfulValue $label)) { continue }
+
+        $sizeValue = Get-FirstValue -Item $item -Names $SizeNames
+        $sizeText = (Convert-QuestValueToText $sizeValue).Replace(',', '')
+        $parsed = [double]0
+        if (-not [double]::TryParse($sizeText, [ref]$parsed)) { continue }
+
+        $bytes = [long][math]::Round(($parsed * $Multiplier), 0)
+        $current = 0
+        if ($ordered.Contains($label)) {
+            $current = [long]$ordered[$label]
+        }
+        $ordered[$label] = [long]($current + $bytes)
+    }
+    return $ordered
+}
+
+function Get-SourceSizeProgressMetrics {
+    param(
+        $SourceSizeByStatus,
+        [string[]]$CompletedLabels,
+        $TotalSourceSize
+    )
+
+    $completedLookup = @{}
+    foreach ($label in @($CompletedLabels)) {
+        if (Test-MeaningfulValue $label) {
+            $completedLookup[$label] = $true
+        }
+    }
+
+    $completedBytes = [double]0
+    $bucketTotalBytes = [double]0
+    foreach ($entry in @($SourceSizeByStatus.GetEnumerator())) {
+        $value = [double]$entry.Value
+        $bucketTotalBytes += $value
+        if ($completedLookup.ContainsKey($entry.Key)) {
+            $completedBytes += $value
+        }
+    }
+
+    $totalBytes = $bucketTotalBytes
+    if ($null -ne $TotalSourceSize -and [double]$TotalSourceSize -gt 0) {
+        $totalBytes = [double]$TotalSourceSize
+    }
+    $remainingBytes = [Math]::Max([double]0, $totalBytes - $completedBytes)
+
+    return [pscustomobject]@{
+        CompletedBytes = [long][math]::Round($completedBytes, 0)
+        RemainingBytes = [long][math]::Round($remainingBytes, 0)
+    }
+}
+
 function Invoke-OdmInternalApi {
     param([string]$Entity, [string]$Method, [string]$Body)
 
@@ -19218,6 +19527,10 @@ function Get-ExchangeMailboxAggregate {
             discoveredTargetMailboxSize = @{ sum = @{ field = 'discoveredObjectTarget.targetMailboxSize' } }
             migrationStatus = @{ terms = @{ field = 'odmeStatus._raw'; size = 25 } }
             mailboxStatus = @{ terms = @{ field = 'mailboxStatus._raw'; size = 25 } }
+            mailboxStatusSourceSize = @{
+                terms = @{ field = 'mailboxStatus._raw'; size = 25 }
+                aggs = @{ sourceSize = @{ sum = @{ field = 'mailboxSize' } } }
+            }
             objectStatus = @{ terms = @{ field = 'status._raw'; size = 25 } }
             recipientTypeDetails = @{ terms = @{ field = 'recipientTypeDetails._raw'; size = 10 } }
         }
@@ -19249,7 +19562,18 @@ function Get-ExchangeMailboxAggregate {
         'discoveredSourceTargetMailboxSize',
         'discoveredTargetMailboxSize'
     )
-    $migratedMetrics = Get-MigratedDataMetrics -ActualMigratedBytes $directMigratedBytes -SourceSize $sourceMailboxSize -ProcessedItems $processedItems -EstimatedItems $estimatedItems -ActualMethodLabel 'Quest target mailbox size'
+    $sourceSizeByStatus = Convert-SourceSizeBucketsToOrderedMap -Buckets $aggregate.mailboxStatusSourceSize.buckets -StateFamily 'mailbox'
+    $sourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $sourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated with Issues') -TotalSourceSize $sourceMailboxSize
+    if ($null -ne $directMigratedBytes -and [double]$directMigratedBytes -gt 0) {
+        $migratedMetrics = Get-MigratedDataMetrics -ActualMigratedBytes $directMigratedBytes -SourceSize $sourceMailboxSize -ProcessedItems $processedItems -EstimatedItems $estimatedItems -ActualMethodLabel 'Quest target mailbox size'
+    }
+    else {
+        $migratedMetrics = [pscustomobject]@{
+            Bytes = $sourceSizeProgress.CompletedBytes
+            IsEstimated = $true
+            Method = 'Estimated from Quest source size in completed mailbox states'
+        }
+    }
     $migratedBytes = $migratedMetrics.Bytes
     $migratedBytesEstimated = $migratedMetrics.IsEstimated
     $migratedBytesMethod = $migratedMetrics.Method
@@ -19261,6 +19585,9 @@ function Get-ExchangeMailboxAggregate {
         MigrationErrors = $migrationErrors
         SourceMailboxItems = $sourceMailboxItems
         SourceMailboxSize = $sourceMailboxSize
+        SourceSizeByStatus = $sourceSizeByStatus
+        CompletedSourceSizeBytes = $sourceSizeProgress.CompletedBytes
+        RemainingSourceSizeBytes = $sourceSizeProgress.RemainingBytes
         MigratedBytes = $migratedBytes
         MigratedBytesEstimated = $migratedBytesEstimated
         MigratedBytesMethod = $migratedBytesMethod
@@ -19313,6 +19640,10 @@ function Get-ExchangeArchiveAggregate {
             discoveredSourceTargetArchiveMailboxSize = @{ sum = @{ field = 'discoveredObjectSource.targetArchiveMailboxSize' } }
             discoveredTargetArchiveMailboxSize = @{ sum = @{ field = 'discoveredObjectTarget.targetArchiveMailboxSize' } }
             archiveMailboxStatus = @{ terms = @{ field = 'archiveMailboxStatus._raw'; size = 25 } }
+            archiveMailboxStatusSourceSize = @{
+                terms = @{ field = 'archiveMailboxStatus._raw'; size = 25 }
+                aggs = @{ sourceSize = @{ sum = @{ field = 'archiveMailboxSize' } } }
+            }
             recipientTypeDetails = @{ terms = @{ field = 'recipientTypeDetails._raw'; size = 10 } }
         }
     }
@@ -19357,7 +19688,18 @@ function Get-ExchangeArchiveAggregate {
         'discoveredSourceTargetArchiveMailboxSize',
         'discoveredTargetArchiveMailboxSize'
     )
-    $migratedMetrics = Get-MigratedDataMetrics -ActualMigratedBytes $directMigratedBytes -SourceSize $archiveSize -ProcessedItems $processedArchive -EstimatedItems $estimatedArchive -ActualMethodLabel 'Quest target archive mailbox size'
+    $sourceSizeByStatus = Convert-SourceSizeBucketsToOrderedMap -Buckets $aggregate.archiveMailboxStatusSourceSize.buckets -StateFamily 'mailbox'
+    $sourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $sourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated with Issues') -TotalSourceSize $archiveSize
+    if ($null -ne $directMigratedBytes -and [double]$directMigratedBytes -gt 0) {
+        $migratedMetrics = Get-MigratedDataMetrics -ActualMigratedBytes $directMigratedBytes -SourceSize $archiveSize -ProcessedItems $processedArchive -EstimatedItems $estimatedArchive -ActualMethodLabel 'Quest target archive mailbox size'
+    }
+    else {
+        $migratedMetrics = [pscustomobject]@{
+            Bytes = $sourceSizeProgress.CompletedBytes
+            IsEstimated = $true
+            Method = 'Estimated from Quest source size in completed archive mailbox states'
+        }
+    }
     $migratedBytes = $migratedMetrics.Bytes
     $migratedBytesEstimated = $migratedMetrics.IsEstimated
     $migratedBytesMethod = $migratedMetrics.Method
@@ -19368,6 +19710,9 @@ function Get-ExchangeArchiveAggregate {
         ArchiveEstimatedItems = $estimatedArchive
         ArchiveItems = $archiveItems
         ArchiveSize = $archiveSize
+        SourceSizeByStatus = $sourceSizeByStatus
+        CompletedSourceSizeBytes = $sourceSizeProgress.CompletedBytes
+        RemainingSourceSizeBytes = $sourceSizeProgress.RemainingBytes
         MigratedBytes = $migratedBytes
         MigratedBytesEstimated = $migratedBytesEstimated
         MigratedBytesMethod = $migratedBytesMethod
@@ -19920,6 +20265,8 @@ function Get-CollaborationAggregate {
                     PlannerTasks = 0
                     MigratedTasks = 0
                     SourceSizeBytes = $null
+                    CompletedSourceSizeBytes = $null
+                    RemainingSourceSizeBytes = $null
                     MigratedBytes = $null
                     StatusBreakdown = [ordered]@{}
                     WorkflowBreakdown = [ordered]@{}
@@ -19935,6 +20282,8 @@ function Get-CollaborationAggregate {
                     PlannerTasks = 0
                     MigratedTasks = 0
                     SourceSizeBytes = $null
+                    CompletedSourceSizeBytes = $null
+                    RemainingSourceSizeBytes = $null
                     MigratedBytes = $null
                     StatusBreakdown = [ordered]@{}
                     WorkflowBreakdown = [ordered]@{}
@@ -19980,6 +20329,10 @@ function Get-CollaborationAggregate {
 
     $aggregations = [ordered]@{
         status = @{ terms = @{ field = 'tm_teamStatus._raw'; size = 25 } }
+        statusSourceContentSizeGb = @{
+            terms = @{ field = 'tm_teamStatus._raw'; size = 25 }
+            aggs = @{ sourceSize = @{ sum = @{ field = 'tm_contentSize' } } }
+        }
         workflow = @{ terms = @{ field = 'tm_workflow._raw'; size = 12 } }
     }
 
@@ -20034,6 +20387,8 @@ function Get-CollaborationAggregate {
     
     $sourceSizeBytes = Convert-GigabytesToBytes (Get-AggregationValue -Aggregate $aggregate -Name 'sourceContentSizeGb')
     $targetSizeBytes = Convert-GigabytesToBytes (Get-AggregationValue -Aggregate $aggregate -Name 'targetContentSizeGb')
+    $sourceSizeByStatus = Convert-SourceSizeBucketsToOrderedMap -Buckets $aggregate.statusSourceContentSizeGb.buckets -StateFamily 'collaboration' -Multiplier 1GB
+    $sourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $sourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated with issues') -TotalSourceSize $sourceSizeBytes
 
     switch ($Type) {
         'Teams' {
@@ -20042,6 +20397,9 @@ function Get-CollaborationAggregate {
                 Teams = [int]$response.hits.total
                 Members = Get-AggregationValue -Aggregate $aggregate -Name 'members'
                 SourceSizeBytes = $sourceSizeBytes
+                SourceSizeByStatus = $sourceSizeByStatus
+                CompletedSourceSizeBytes = $sourceSizeProgress.CompletedBytes
+                RemainingSourceSizeBytes = $sourceSizeProgress.RemainingBytes
                 MigratedBytes = $migratedMetrics.Bytes
                 MigratedBytesEstimated = $migratedMetrics.IsEstimated
                 MigratedBytesMethod = $migratedMetrics.Method
@@ -20062,6 +20420,9 @@ function Get-CollaborationAggregate {
                 Groups = [int]$response.hits.total
                 Members = Get-AggregationValue -Aggregate $aggregate -Name 'members'
                 SourceSizeBytes = $sourceSizeBytes
+                SourceSizeByStatus = $sourceSizeByStatus
+                CompletedSourceSizeBytes = $sourceSizeProgress.CompletedBytes
+                RemainingSourceSizeBytes = $sourceSizeProgress.RemainingBytes
                 MigratedBytes = $migratedMetrics.Bytes
                 MigratedBytesEstimated = $migratedMetrics.IsEstimated
                 MigratedBytesMethod = $migratedMetrics.Method
@@ -20312,6 +20673,14 @@ function Get-SharePointAggregate {
             objectStatus = @{ terms = @{ field = 'status._raw'; size = 25 } }
             objectType = @{ terms = @{ field = 'spmType._raw'; size = 10 } }
             siteType = @{ terms = @{ field = 'spmSiteType._raw'; size = 10 } }
+            migratedStateSourceStorageMb = @{
+                terms = @{ field = 'spmMigratedState._raw'; size = 25 }
+                aggs = @{ sourceSize = @{ sum = @{ field = 'spmStorageUsage' } } }
+            }
+            migrationStatusSourceStorageMb = @{
+                terms = @{ field = 'spmMigrationStatus._raw'; size = 25 }
+                aggs = @{ sourceSize = @{ sum = @{ field = 'spmStorageUsage' } } }
+            }
             siteObjects = @{
                 filter = @{ term = @{ 'spmType._raw' = 'Site' } }
                 aggs = @{
@@ -20366,13 +20735,22 @@ function Get-SharePointAggregate {
     if ((Sum-Breakdown -Breakdown $siteStatusBreakdown) -eq 0) {
         $siteStatusBreakdown = $statusBreakdown
     }
+    $sourceSizeBytes = Convert-MegabytesToBytes (Get-AggregationValue -Aggregate $aggregate -Name 'sourceStorageUsageMb')
+    $sourceSizeByStatus = Convert-SourceSizeBucketsToOrderedMap -Buckets $aggregate.migratedStateSourceStorageMb.buckets -StateFamily 'sharepoint' -Multiplier 1MB
+    if ($sourceSizeByStatus.Count -eq 0) {
+        $sourceSizeByStatus = Convert-SourceSizeBucketsToOrderedMap -Buckets $aggregate.migrationStatusSourceStorageMb.buckets -StateFamily 'sharepoint' -Multiplier 1MB
+    }
+    $sourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $sourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated With Issues') -TotalSourceSize $sourceSizeBytes
 
     return [pscustomobject]@{
         Objects = Get-TotalHitsValue -Response $response
         Sites = $siteObjects
         MigratableObjects = $(if ($null -ne $aggregate.migratable) { [int]$aggregate.migratable.doc_count } else { 0 })
         MigratableSites = $migratableSites
-        SourceSizeBytes = Convert-MegabytesToBytes (Get-AggregationValue -Aggregate $aggregate -Name 'sourceStorageUsageMb')
+        SourceSizeBytes = $sourceSizeBytes
+        SourceSizeByStatus = $sourceSizeByStatus
+        CompletedSourceSizeBytes = $sourceSizeProgress.CompletedBytes
+        RemainingSourceSizeBytes = $sourceSizeProgress.RemainingBytes
         SourceChildren = Get-AggregationValue -Aggregate $aggregate -Name 'sourceChildren'
         TargetChildren = Get-AggregationValue -Aggregate $aggregate -Name 'targetChildren'
         RollupCount = Get-AggregationValue -Aggregate $aggregate -Name 'rollupCount'
@@ -20807,6 +21185,12 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         if ($null -ne $mailboxAggregate.MigratedBytes) {
                             $mailboxStats['Migrated Data (bytes)'] = $mailboxAggregate.MigratedBytes
                         }
+                        if ($null -ne $mailboxAggregate.CompletedSourceSizeBytes) {
+                            $mailboxStats['Completed Source Size (bytes)'] = $mailboxAggregate.CompletedSourceSizeBytes
+                        }
+                        if ($null -ne $mailboxAggregate.RemainingSourceSizeBytes) {
+                            $mailboxStats['Remaining Source Size (bytes)'] = $mailboxAggregate.RemainingSourceSizeBytes
+                        }
                         if ($null -ne $mailboxTaskMetrics -and $null -ne $mailboxTaskMetrics.TaskHours -and [double]$mailboxTaskMetrics.TaskHours -gt 0 -and $null -ne $mailboxAggregate.MigratedBytes) {
                             $mailboxThroughput = [math]::Round(([double]$mailboxAggregate.MigratedBytes / [double]$mailboxTaskMetrics.TaskHours), 2)
                             $mailboxStats['Average Throughput (bytes/hour)'] = $mailboxThroughput
@@ -20824,6 +21208,9 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         }
                         elseif ($null -ne $mailboxAggregate.MigratedBytes) {
                             $summary.Details['Migrated Data Accuracy'] = 'Direct from Quest target size'
+                        }
+                        if ($null -ne $mailboxAggregate.RemainingSourceSizeBytes) {
+                            $summary.Details['Remaining Data Source'] = 'Quest source mailbox size in non-completed mailbox states'
                         }
                         if ($null -ne $mailboxTaskMetrics) {
                             $summary.Details['Migration Task Count'] = $mailboxTaskMetrics.TaskCount
@@ -20851,6 +21238,12 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                                 if ($null -ne $archiveAggregate.MigratedBytes) {
                                     $archiveStats['Migrated Data (bytes)'] = $archiveAggregate.MigratedBytes
                                 }
+                                if ($null -ne $archiveAggregate.CompletedSourceSizeBytes) {
+                                    $archiveStats['Completed Source Size (bytes)'] = $archiveAggregate.CompletedSourceSizeBytes
+                                }
+                                if ($null -ne $archiveAggregate.RemainingSourceSizeBytes) {
+                                    $archiveStats['Remaining Source Size (bytes)'] = $archiveAggregate.RemainingSourceSizeBytes
+                                }
                                 if ($null -ne $archiveTaskMetrics -and $null -ne $archiveTaskMetrics.TaskHours -and [double]$archiveTaskMetrics.TaskHours -gt 0 -and $null -ne $archiveAggregate.MigratedBytes) {
                                     $archiveThroughput = [math]::Round(([double]$archiveAggregate.MigratedBytes / [double]$archiveTaskMetrics.TaskHours), 2)
                                     $archiveStats['Average Throughput (bytes/hour)'] = $archiveThroughput
@@ -20869,6 +21262,9 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                                 }
                                 elseif ($null -ne $archiveAggregate.MigratedBytes) {
                                     $archiveSummary.Details['Migrated Data Accuracy'] = 'Direct from Quest target size'
+                                }
+                                if ($null -ne $archiveAggregate.RemainingSourceSizeBytes) {
+                                    $archiveSummary.Details['Remaining Data Source'] = 'Quest source archive mailbox size in non-completed archive mailbox states'
                                 }
                                 if ($null -ne $archiveTaskMetrics) {
                                     $archiveSummary.Details['Migration Task Count'] = $archiveTaskMetrics.TaskCount
@@ -21222,6 +21618,13 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                     if ($null -ne $sharePointAggregate.SourceSizeBytes) {
                         $stats['Source Size (bytes)'] = $sharePointAggregate.SourceSizeBytes
                     }
+                    if ($null -ne $sharePointAggregate.CompletedSourceSizeBytes) {
+                        $stats['Completed Source Size (bytes)'] = $sharePointAggregate.CompletedSourceSizeBytes
+                        $stats['Migrated Data (bytes)'] = $sharePointAggregate.CompletedSourceSizeBytes
+                    }
+                    if ($null -ne $sharePointAggregate.RemainingSourceSizeBytes) {
+                        $stats['Remaining Source Size (bytes)'] = $sharePointAggregate.RemainingSourceSizeBytes
+                    }
                     foreach ($stateEntry in $sharePointAggregate.SiteStatusBreakdown.GetEnumerator()) {
                         $stats[$stateEntry.Key] = $stateEntry.Value
                     }
@@ -21235,6 +21638,13 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         $sharePointSummary.Details['Quest Site Filter'] = 'Standalone SharePoint sites only'
                         $sharePointSummary.Details['Query Strategy'] = $(if ($sharePointAggregate.ScopeCollections.Count -gt 0) { 'Quest collection-scoped aggregate query' } else { 'Quest workload aggregate query' })
                     }
+                    if ($null -ne $sharePointAggregate.CompletedSourceSizeBytes) {
+                        $sharePointSummary.Details['Migrated Data Source'] = 'Estimated from Quest source storage in completed standalone SharePoint states'
+                        $sharePointSummary.Details['Migrated Data Accuracy'] = 'Estimated'
+                    }
+                    if ($null -ne $sharePointAggregate.RemainingSourceSizeBytes) {
+                        $sharePointSummary.Details['Remaining Data Source'] = 'Quest source storage in non-completed standalone SharePoint states'
+                    }
                     $summaries.Add($sharePointSummary) | Out-Null
                     break
                 }
@@ -21247,20 +21657,21 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                     Write-ProgressMarker -Message 'Running the Quest SharePoint compact object query...' -Percent 48
                 }
                 if ($scopeCollections.Count -gt 0) {
-                    $objects = Get-ScopedCompactObjects -ScopeCollections $scopeCollections -Properties @('spmMigrationStatus', 'spmMigratedState', 'spmState', 'status', 'spmType', 'spmSiteType', 'migratable', 'SourceChildrenCount', 'TargetChildrenCount', 'RollupCount', 'spmStorageUsage', 'spmSize') -ProgressLabel 'Enumerating scoped SharePoint collections' -ProgressStart 52 -ProgressEnd 74
+                    $objects = Get-ScopedCompactObjects -ScopeCollections $scopeCollections -Properties @('spmMigrationStatus', 'SpmMigrationStatus', 'spmMigratedState', 'SpmMigratedState', 'spmState', 'SpmState', 'status', 'spmType', 'SpmType', 'spmSiteType', 'SpmSiteType', 'migratable', 'SourceChildrenCount', 'TargetChildrenCount', 'RollupCount', 'spmStorageUsage', 'SpmStorageUsage', 'spmSize', 'SpmSize') -ProgressLabel 'Enumerating scoped SharePoint collections' -ProgressStart 52 -ProgressEnd 74
                 }
                 else {
-                    $objects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -All } -Properties @('spmMigrationStatus', 'spmMigratedState', 'spmState', 'status', 'spmType', 'spmSiteType', 'migratable', 'SourceChildrenCount', 'TargetChildrenCount', 'RollupCount', 'spmStorageUsage', 'spmSize')
+                    $objects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -All } -Properties @('spmMigrationStatus', 'SpmMigrationStatus', 'spmMigratedState', 'SpmMigratedState', 'spmState', 'SpmState', 'status', 'spmType', 'SpmType', 'spmSiteType', 'SpmSiteType', 'migratable', 'SourceChildrenCount', 'TargetChildrenCount', 'RollupCount', 'spmStorageUsage', 'SpmStorageUsage', 'spmSize', 'SpmSize')
                 }
                 if ($stream -eq 'sharepoint') {
                     $objects = @($objects | Where-Object {
-                        $siteType = Get-FirstValue -Item $_ -Names @('spmSiteType', 'SiteType')
-                        -not (Test-MeaningfulValue $siteType) -or $siteType -eq 'SharePoint'
+                        $siteType = Get-FirstValue -Item $_ -Names @('spmSiteType', 'SpmSiteType', 'SiteType')
+                        $siteTypeText = Convert-QuestValueToText $siteType
+                        -not (Test-MeaningfulValue $siteTypeText) -or $siteTypeText.Equals('SharePoint', [System.StringComparison]::OrdinalIgnoreCase)
                     })
                 }
                 $siteObjects = @($objects | Where-Object {
                     $objectType = Get-FirstValue -Item $_ -Names @('spmType', 'SpmType')
-                    $objectTypeText = if ($null -ne $objectType) { $objectType.ToString() } else { '' }
+                    $objectTypeText = Convert-QuestValueToText $objectType
                     $objectTypeText.Trim() -eq 'Site'
                 })
                 $headlineObjects = @(if ($siteObjects.Count -gt 0) { $siteObjects } else { $objects })
@@ -21277,16 +21688,32 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                 if ($null -ne $sharePointSourceSizeBytes) {
                     $stats['Source Size (bytes)'] = $sharePointSourceSizeBytes
                 }
-                $sharePointStatusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Count-By -Items $headlineObjects -Names @('spmMigrationStatus', 'spmMigratedState', 'spmState', 'MigrationStatus', 'MigratedState', 'State', 'Status')) -IncludeMissing
+                $sharePointSourceSizeByStatus = Get-ObjectSourceSizeByStatus -Items $objects -StateNames @('spmMigratedState', 'SpmMigratedState', 'spmMigrationStatus', 'SpmMigrationStatus', 'spmState', 'SpmState', 'MigrationStatus', 'MigratedState', 'State', 'Status') -SizeNames @('spmStorageUsage', 'SpmStorageUsage', 'StorageUsage', 'spmSize', 'SpmSize') -StateFamily 'sharepoint' -Multiplier 1MB
+                $sharePointSourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $sharePointSourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated With Issues') -TotalSourceSize $sharePointSourceSizeBytes
+                if ($null -ne $sharePointSourceSizeProgress.CompletedBytes) {
+                    $stats['Completed Source Size (bytes)'] = $sharePointSourceSizeProgress.CompletedBytes
+                    $stats['Migrated Data (bytes)'] = $sharePointSourceSizeProgress.CompletedBytes
+                }
+                if ($null -ne $sharePointSourceSizeProgress.RemainingBytes) {
+                    $stats['Remaining Source Size (bytes)'] = $sharePointSourceSizeProgress.RemainingBytes
+                }
+                $sharePointStatusBreakdown = Convert-ToQuestSharePointStateBreakdown -Breakdown (Count-By -Items $headlineObjects -Names @('spmMigrationStatus', 'SpmMigrationStatus', 'spmMigratedState', 'SpmMigratedState', 'spmState', 'SpmState', 'MigrationStatus', 'MigratedState', 'State', 'Status')) -IncludeMissing
                 $sharePointSummary = New-Summary -Workload $workload -DisplayType 'SharePoint' -Objects $headlineObjects -Stats $stats -StatusBreakdown $sharePointStatusBreakdown -ExtraBreakdowns @(
                     (New-BreakdownPair -Prefix 'Object Type' -Breakdown (Count-By -Items $objects -Names @('spmType', 'SpmType')))
-                    (New-BreakdownPair -Prefix 'Site Type' -Breakdown (Count-By -Items $objects -Names @('spmSiteType', 'SiteType')))
+                    (New-BreakdownPair -Prefix 'Site Type' -Breakdown (Count-By -Items $objects -Names @('spmSiteType', 'SpmSiteType', 'SiteType')))
                 )
                 $sharePointSummary = Add-SharePointScopeDetails -Summary $sharePointSummary -ScopeCollections $scopeCollections
                 $sharePointSummary.Details['SharePoint Objects Queried'] = $objects.Count
                 if ($stream -eq 'sharepoint') {
                     $sharePointSummary.Details['Quest Site Filter'] = 'Standalone SharePoint sites only'
                     $sharePointSummary.Details['Query Strategy'] = $(if ($scopeCollections.Count -gt 0) { 'Quest scoped collection enumeration' } else { 'Quest workload compact object query' })
+                }
+                if ($null -ne $sharePointSourceSizeProgress.CompletedBytes) {
+                    $sharePointSummary.Details['Migrated Data Source'] = 'Estimated from Quest source storage in completed standalone SharePoint states'
+                    $sharePointSummary.Details['Migrated Data Accuracy'] = 'Estimated'
+                }
+                if ($null -ne $sharePointSourceSizeProgress.RemainingBytes) {
+                    $sharePointSummary.Details['Remaining Data Source'] = 'Quest source storage in non-completed standalone SharePoint states'
                 }
                 $summaries.Add($sharePointSummary) | Out-Null
                 break
@@ -21312,6 +21739,12 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         if ($null -ne $teamAggregate.SourceSizeBytes) {
                             $teamStats['Source Size (bytes)'] = $teamAggregate.SourceSizeBytes
                         }
+                        if ($null -ne $teamAggregate.CompletedSourceSizeBytes) {
+                            $teamStats['Completed Source Size (bytes)'] = $teamAggregate.CompletedSourceSizeBytes
+                        }
+                        if ($null -ne $teamAggregate.RemainingSourceSizeBytes) {
+                            $teamStats['Remaining Source Size (bytes)'] = $teamAggregate.RemainingSourceSizeBytes
+                        }
                         if ($null -ne $teamAggregate.MigratedBytes) {
                             $teamStats['Migrated Data (bytes)'] = $teamAggregate.MigratedBytes
                         }
@@ -21322,6 +21755,10 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         if ($null -ne $teamAggregate.MigratedBytes) {
                             $teamSummary.Details['Migrated Data Source'] = 'Direct from Quest target content size telemetry'
                             $teamSummary.Details['Migrated Data Accuracy'] = 'Direct from Quest target content size'
+                            $teamSummary.Details['Teams Data Display'] = 'Target content present is shown separately from source still to complete; it is not subtracted from source size.'
+                        }
+                        if ($null -ne $teamAggregate.RemainingSourceSizeBytes) {
+                            $teamSummary.Details['Remaining Data Source'] = 'Quest source content size in non-completed Team states'
                         }
                         $collaborationSummaries.Add($teamSummary) | Out-Null
 
@@ -21340,6 +21777,12 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                             if ($null -ne $groupAggregate.SourceSizeBytes) {
                                 $groupStats['Source Size (bytes)'] = $groupAggregate.SourceSizeBytes
                             }
+                            if ($null -ne $groupAggregate.CompletedSourceSizeBytes) {
+                                $groupStats['Completed Source Size (bytes)'] = $groupAggregate.CompletedSourceSizeBytes
+                            }
+                            if ($null -ne $groupAggregate.RemainingSourceSizeBytes) {
+                                $groupStats['Remaining Source Size (bytes)'] = $groupAggregate.RemainingSourceSizeBytes
+                            }
                             if ($null -ne $groupAggregate.MigratedBytes) {
                                 $groupStats['Migrated Data (bytes)'] = $groupAggregate.MigratedBytes
                             }
@@ -21350,6 +21793,9 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                             if ($null -ne $groupAggregate.MigratedBytes) {
                                 $groupSummary.Details['Migrated Data Source'] = 'Direct from Quest target content size telemetry'
                                 $groupSummary.Details['Migrated Data Accuracy'] = 'Direct from Quest target content size'
+                            }
+                            if ($null -ne $groupAggregate.RemainingSourceSizeBytes) {
+                                $groupSummary.Details['Remaining Data Source'] = 'Quest source content size in non-completed M365 Group states'
                             }
                             $collaborationSummaries.Add($groupSummary) | Out-Null
                         }
@@ -21380,7 +21826,7 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         Write-ProgressMarker -Message 'Quest collaboration aggregate was unavailable. Falling back to Teams object enumeration...' -Percent 38
                     }
                 }
-                $teamObjects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -All } -Properties @('MigrationState', 'Status', 'State', 'Workflow', 'TotalMemberCount', 'TeamMessagesCount', 'TotalMigratedTeamMessagesCount', 'PlannerPlanCount', 'MigratedPlannerPlanCount', 'PlannerTaskCount', 'MigratedPlannerTaskCount', 'SourceFiles_GB', 'TargetFiles_GB', 'tm_contentSize', 'tm_targetContentSize')
+                $teamObjects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -All } -Properties @('MigrationState', 'Status', 'State', 'Workflow', 'tm_teamStatus', 'TmTeamStatus', 'TotalMemberCount', 'TeamMessagesCount', 'TotalMigratedTeamMessagesCount', 'PlannerPlanCount', 'MigratedPlannerPlanCount', 'PlannerTaskCount', 'MigratedPlannerTaskCount', 'SourceFiles_GB', 'TargetFiles_GB', 'tm_contentSize', 'tm_targetContentSize')
                 $teamStats = [ordered]@{
                     'Teams' = $teamObjects.Count
                     'Members' = $(Sum-Property -Items $teamObjects -Names @('TotalMemberCount'))
@@ -21393,16 +21839,24 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                 }
                 $teamSourceSizeBytes = Convert-GigabytesToBytes (Sum-Property -Items $teamObjects -Names @('SourceFiles_GB', 'tm_contentSize'))
                 $teamMigratedBytes = Convert-GigabytesToBytes (Sum-Property -Items $teamObjects -Names @('TargetFiles_GB', 'tm_targetContentSize'))
+                $teamSourceSizeByStatus = Get-ObjectSourceSizeByStatus -Items $teamObjects -StateNames @('tm_teamStatus', 'TmTeamStatus', 'Status', 'MigrationState', 'State') -SizeNames @('SourceFiles_GB', 'tm_contentSize') -StateFamily 'collaboration' -Multiplier 1GB
+                $teamSourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $teamSourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated with issues') -TotalSourceSize $teamSourceSizeBytes
                 if ($null -ne $teamSourceSizeBytes) { $teamStats['Source Size (bytes)'] = $teamSourceSizeBytes }
+                if ($null -ne $teamSourceSizeProgress.CompletedBytes) { $teamStats['Completed Source Size (bytes)'] = $teamSourceSizeProgress.CompletedBytes }
+                if ($null -ne $teamSourceSizeProgress.RemainingBytes) { $teamStats['Remaining Source Size (bytes)'] = $teamSourceSizeProgress.RemainingBytes }
                 if ($null -ne $teamMigratedBytes) { $teamStats['Migrated Data (bytes)'] = $teamMigratedBytes }
-                $teamSummary = New-Summary -Workload $workload -DisplayType 'Teams' -Objects $teamObjects -Stats $teamStats -StatusBreakdown (Convert-ToQuestCollaborationStateBreakdown -Breakdown (Count-By -Items $teamObjects -Names @('Status', 'MigrationState', 'State')) -IncludeMissing) -ExtraBreakdowns @((New-BreakdownPair -Prefix 'Workflow' -Breakdown (Count-By -Items $teamObjects -Names @('Workflow'))))
+                $teamSummary = New-Summary -Workload $workload -DisplayType 'Teams' -Objects $teamObjects -Stats $teamStats -StatusBreakdown (Convert-ToQuestCollaborationStateBreakdown -Breakdown (Count-By -Items $teamObjects -Names @('tm_teamStatus', 'TmTeamStatus', 'Status', 'MigrationState', 'State')) -IncludeMissing) -ExtraBreakdowns @((New-BreakdownPair -Prefix 'Workflow' -Breakdown (Count-By -Items $teamObjects -Names @('Workflow'))))
                 if ($null -ne $teamMigratedBytes) {
                     $teamSummary.Details['Migrated Data Source'] = 'Direct from Quest target content size telemetry'
                     $teamSummary.Details['Migrated Data Accuracy'] = 'Direct from Quest target content size'
+                    $teamSummary.Details['Teams Data Display'] = 'Target content present is shown separately from source still to complete; it is not subtracted from source size.'
+                }
+                if ($null -ne $teamSourceSizeProgress.RemainingBytes) {
+                    $teamSummary.Details['Remaining Data Source'] = 'Quest source content size in non-completed Team states'
                 }
                 $summaries.Add($teamSummary) | Out-Null
 
-                $groupObjects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -TypeOfTeam Groups -All } -Properties @('MigrationState', 'Status', 'State', 'Workflow', 'TotalMemberCount', 'PlannerPlanCount', 'PlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'SourceFiles_GB', 'TargetFiles_GB', 'tm_contentSize', 'tm_targetContentSize')
+                $groupObjects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -TypeOfTeam Groups -All } -Properties @('MigrationState', 'Status', 'State', 'Workflow', 'tm_teamStatus', 'TmTeamStatus', 'TotalMemberCount', 'PlannerPlanCount', 'PlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'SourceFiles_GB', 'TargetFiles_GB', 'tm_contentSize', 'tm_targetContentSize')
                 if (-not $hasStandaloneGroupsWorkload -and $groupObjects.Count -gt 0) {
                     $groupStats = [ordered]@{
                         'Groups' = $groupObjects.Count
@@ -21414,12 +21868,19 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                     }
                     $groupSourceSizeBytes = Convert-GigabytesToBytes (Sum-Property -Items $groupObjects -Names @('SourceFiles_GB', 'tm_contentSize'))
                     $groupMigratedBytes = Convert-GigabytesToBytes (Sum-Property -Items $groupObjects -Names @('TargetFiles_GB', 'tm_targetContentSize'))
+                    $groupSourceSizeByStatus = Get-ObjectSourceSizeByStatus -Items $groupObjects -StateNames @('tm_teamStatus', 'TmTeamStatus', 'Status', 'MigrationState', 'State') -SizeNames @('SourceFiles_GB', 'tm_contentSize') -StateFamily 'collaboration' -Multiplier 1GB
+                    $groupSourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $groupSourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated with issues') -TotalSourceSize $groupSourceSizeBytes
                     if ($null -ne $groupSourceSizeBytes) { $groupStats['Source Size (bytes)'] = $groupSourceSizeBytes }
+                    if ($null -ne $groupSourceSizeProgress.CompletedBytes) { $groupStats['Completed Source Size (bytes)'] = $groupSourceSizeProgress.CompletedBytes }
+                    if ($null -ne $groupSourceSizeProgress.RemainingBytes) { $groupStats['Remaining Source Size (bytes)'] = $groupSourceSizeProgress.RemainingBytes }
                     if ($null -ne $groupMigratedBytes) { $groupStats['Migrated Data (bytes)'] = $groupMigratedBytes }
-                    $groupSummary = New-Summary -Workload $workload -DisplayType 'M365 Groups' -Objects $groupObjects -Stats $groupStats -StatusBreakdown (Convert-ToQuestCollaborationStateBreakdown -Breakdown (Count-By -Items $groupObjects -Names @('Status', 'MigrationState', 'State')) -IncludeMissing) -ExtraBreakdowns @((New-BreakdownPair -Prefix 'Workflow' -Breakdown (Count-By -Items $groupObjects -Names @('Workflow'))))
+                    $groupSummary = New-Summary -Workload $workload -DisplayType 'M365 Groups' -Objects $groupObjects -Stats $groupStats -StatusBreakdown (Convert-ToQuestCollaborationStateBreakdown -Breakdown (Count-By -Items $groupObjects -Names @('tm_teamStatus', 'TmTeamStatus', 'Status', 'MigrationState', 'State')) -IncludeMissing) -ExtraBreakdowns @((New-BreakdownPair -Prefix 'Workflow' -Breakdown (Count-By -Items $groupObjects -Names @('Workflow'))))
                     if ($null -ne $groupMigratedBytes) {
                         $groupSummary.Details['Migrated Data Source'] = 'Direct from Quest target content size telemetry'
                         $groupSummary.Details['Migrated Data Accuracy'] = 'Direct from Quest target content size'
+                    }
+                    if ($null -ne $groupSourceSizeProgress.RemainingBytes) {
+                        $groupSummary.Details['Remaining Data Source'] = 'Quest source content size in non-completed M365 Group states'
                     }
                     $summaries.Add($groupSummary) | Out-Null
                 }
@@ -21453,6 +21914,12 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         if ($null -ne $groupAggregate.SourceSizeBytes) {
                             $groupStats['Source Size (bytes)'] = $groupAggregate.SourceSizeBytes
                         }
+                        if ($null -ne $groupAggregate.CompletedSourceSizeBytes) {
+                            $groupStats['Completed Source Size (bytes)'] = $groupAggregate.CompletedSourceSizeBytes
+                        }
+                        if ($null -ne $groupAggregate.RemainingSourceSizeBytes) {
+                            $groupStats['Remaining Source Size (bytes)'] = $groupAggregate.RemainingSourceSizeBytes
+                        }
                         if ($null -ne $groupAggregate.MigratedBytes) {
                             $groupStats['Migrated Data (bytes)'] = $groupAggregate.MigratedBytes
                         }
@@ -21464,6 +21931,9 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                             $groupSummary.Details['Migrated Data Source'] = 'Direct from Quest target content size telemetry'
                             $groupSummary.Details['Migrated Data Accuracy'] = 'Direct from Quest target content size'
                         }
+                        if ($null -ne $groupAggregate.RemainingSourceSizeBytes) {
+                            $groupSummary.Details['Remaining Data Source'] = 'Quest source content size in non-completed M365 Group states'
+                        }
                         $summaries.Add($groupSummary) | Out-Null
                         break
                     }
@@ -21471,7 +21941,7 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                         Write-ProgressMarker -Message 'Quest M365 Groups aggregate was unavailable. Falling back to group object enumeration...' -Percent 30
                     }
                 }
-                $groupObjects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -TypeOfTeam Groups -All } -Properties @('MigrationState', 'Status', 'State', 'Workflow', 'TotalMemberCount', 'PlannerPlanCount', 'PlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'SourceFiles_GB', 'TargetFiles_GB', 'tm_contentSize', 'tm_targetContentSize')
+                $groupObjects = Select-CompactObjects -Command { Get-OdmObject -FilterObject $workload -TypeOfTeam Groups -All } -Properties @('MigrationState', 'Status', 'State', 'Workflow', 'tm_teamStatus', 'TmTeamStatus', 'TotalMemberCount', 'PlannerPlanCount', 'PlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'MigratedPlannerPlanCount', 'MigratedPlannerTaskCount', 'SourceFiles_GB', 'TargetFiles_GB', 'tm_contentSize', 'tm_targetContentSize')
                 $groupStats = [ordered]@{
                     'Groups' = $groupObjects.Count
                     'Members' = $(Sum-Property -Items $groupObjects -Names @('TotalMemberCount'))
@@ -21482,12 +21952,19 @@ for ($index = 0; $index -lt $workloads.Count; $index++) {
                 }
                 $groupSourceSizeBytes = Convert-GigabytesToBytes (Sum-Property -Items $groupObjects -Names @('SourceFiles_GB', 'tm_contentSize'))
                 $groupMigratedBytes = Convert-GigabytesToBytes (Sum-Property -Items $groupObjects -Names @('TargetFiles_GB', 'tm_targetContentSize'))
+                $groupSourceSizeByStatus = Get-ObjectSourceSizeByStatus -Items $groupObjects -StateNames @('tm_teamStatus', 'TmTeamStatus', 'Status', 'MigrationState', 'State') -SizeNames @('SourceFiles_GB', 'tm_contentSize') -StateFamily 'collaboration' -Multiplier 1GB
+                $groupSourceSizeProgress = Get-SourceSizeProgressMetrics -SourceSizeByStatus $groupSourceSizeByStatus -CompletedLabels @('Migrated', 'Migrated with issues') -TotalSourceSize $groupSourceSizeBytes
                 if ($null -ne $groupSourceSizeBytes) { $groupStats['Source Size (bytes)'] = $groupSourceSizeBytes }
+                if ($null -ne $groupSourceSizeProgress.CompletedBytes) { $groupStats['Completed Source Size (bytes)'] = $groupSourceSizeProgress.CompletedBytes }
+                if ($null -ne $groupSourceSizeProgress.RemainingBytes) { $groupStats['Remaining Source Size (bytes)'] = $groupSourceSizeProgress.RemainingBytes }
                 if ($null -ne $groupMigratedBytes) { $groupStats['Migrated Data (bytes)'] = $groupMigratedBytes }
-                $groupSummary = New-Summary -Workload $workload -DisplayType 'M365 Groups' -Objects $groupObjects -Stats $groupStats -StatusBreakdown (Convert-ToQuestCollaborationStateBreakdown -Breakdown (Count-By -Items $groupObjects -Names @('Status', 'MigrationState', 'State')) -IncludeMissing) -ExtraBreakdowns @((New-BreakdownPair -Prefix 'Workflow' -Breakdown (Count-By -Items $groupObjects -Names @('Workflow'))))
+                $groupSummary = New-Summary -Workload $workload -DisplayType 'M365 Groups' -Objects $groupObjects -Stats $groupStats -StatusBreakdown (Convert-ToQuestCollaborationStateBreakdown -Breakdown (Count-By -Items $groupObjects -Names @('tm_teamStatus', 'TmTeamStatus', 'Status', 'MigrationState', 'State')) -IncludeMissing) -ExtraBreakdowns @((New-BreakdownPair -Prefix 'Workflow' -Breakdown (Count-By -Items $groupObjects -Names @('Workflow'))))
                 if ($null -ne $groupMigratedBytes) {
                     $groupSummary.Details['Migrated Data Source'] = 'Direct from Quest target content size telemetry'
                     $groupSummary.Details['Migrated Data Accuracy'] = 'Direct from Quest target content size'
+                }
+                if ($null -ne $groupSourceSizeProgress.RemainingBytes) {
+                    $groupSummary.Details['Remaining Data Source'] = 'Quest source content size in non-completed M365 Group states'
                 }
                 $summaries.Add($groupSummary) | Out-Null
                 break
